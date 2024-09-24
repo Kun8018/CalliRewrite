@@ -410,7 +410,7 @@ def main_testing(test_image_base_dir, test_dataset, test_image_name,
                  round_stop_state_num, stroke_acc_threshold,
                  draw_seq=False, draw_order=False,
                  state_dependent=True):
-    model_params_default = hparams.get_default_hparams_clean()
+    model_params_default = hparams.get_default_hparams_phase_2()
     model_params = update_hyperparams(model_params_default, model_base_dir, model_name, infer_dataset=test_dataset)
 
     [test_set, eval_hps_model, sample_hps_model] \
