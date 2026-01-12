@@ -26,7 +26,9 @@ For more information, please visit our [**project page**](https://luoprojectpage
 
 
 ## 📬 News
-- **2024.4.25** Coarse Sequence Extraction checjpoints released.
+- **2026.1** 🎉 Added MuJoCo simulation support and Franka robot integration!
+- **2026.1** 📚 Comprehensive documentation added for all modules
+- **2024.4.25** Coarse Sequence Extraction checkpoints released.
 - **2024.4.6** CalliRewrite has been selected as a finalist for the IEEE ICRA Best Paper Award in Service Robotics
 - **2024.2.27** Version 1.0 upload
 
@@ -73,6 +75,19 @@ Due to package version dependencies, we need to set up two separate environments
 
 By following these steps, you will have two separate conda environments configured for coarse sequence extraction and sequence fine-tuning, ensuring that the correct dependencies are installed for each task.
 
+## 📖 Documentation
+
+We provide comprehensive documentation for all modules:
+
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Complete system architecture and data flow
+- **[seq_extract/TRAINING_PROCESS.md](seq_extract/TRAINING_PROCESS.md)** - Detailed LSTM training process
+- **[rl_finetune/TRAINING_PROCESS.md](rl_finetune/TRAINING_PROCESS.md)** - SAC reinforcement learning training
+- **[callibrate/NPZ_FILE_EXPLAINED.md](callibrate/NPZ_FILE_EXPLAINED.md)** - NPZ file format and conversion
+- **[callibrate/REAL_CASE_STUDY.md](callibrate/REAL_CASE_STUDY.md)** - Real case study walkthrough
+- **[callibrate/FRANKA_SETUP.md](callibrate/FRANKA_SETUP.md)** - Franka robot setup guide
+- **[mujoco_sim/README.md](mujoco_sim/README.md)** - MuJoCo simulation guide
+
+
 ### 1. Caliberate your own writing utensil
 
 We provide three simple tools for modeling in the reinforcement learning environment: **Calligraphy brush**, **fude pen**, and **flat tip marker**. The geometry and dynamic properties are defined in `./rl_finetune/Callienv/envs/tools.py` and folder `./rl_finetune/tool_property/`.  You can also define your own utensil easily.
@@ -116,7 +131,63 @@ Then you can have an easy startup:
    bash ./scripts/train_brush.sh
    ```
 
-### 5. Visualization and robotic demonstration
+### 5. MuJoCo Simulation (Optional but Recommended)
+
+Before deploying to real robots, you can test trajectories in MuJoCo simulation:
+
+```bash
+# Install MuJoCo dependencies
+cd mujoco_sim
+pip install -r requirements.txt
+
+# Quick test
+bash quick_test.sh
+
+# Run simulation with your trajectory
+python mujoco_simulator.py ../callibrate/examples/example_永.npz --speed 0.05
+
+# Record video
+python mujoco_simulator.py ../callibrate/examples/example_永.npz \
+    --record outputs/video.mp4 --speed 0.05
+```
+
+See [mujoco_sim/README.md](mujoco_sim/README.md) for detailed documentation.
+
+### 6. Robot Deployment
+
+#### For Dobot Magician (Original)
+
+Follow the calibration notebook in `./callibrate/callibrate.ipynb`.
+
+#### For Franka Emika (Panda/FR3) - NEW!
+
+We now support Franka robots with comprehensive calibration and control:
+
+```bash
+cd callibrate
+
+# 1. Generate calibration test file
+python calibrate.py --mode generate --tool brush
+
+# 2. Run calibration on robot
+python RoboControl.py examples/test_calibration.npz <robot_ip> 0.05
+
+# 3. Measure and fit r-z relationship
+python calibrate.py --mode fit --tool brush \
+    --widths <measured_widths> --zs <test_heights>
+
+# 4. Convert RL output to robot coordinates
+python calibrate.py --mode convert --tool brush \
+    --input ../rl_finetune/results/character.npy \
+    --output character.npz --alpha 0.04 --beta 0.5
+
+# 5. Execute on robot
+python RoboControl.py character.npz <robot_ip> 0.05
+```
+
+See [callibrate/FRANKA_SETUP.md](callibrate/FRANKA_SETUP.md) for detailed setup instructions.
+
+### 7. Visualization and Analysis
 
 
 ## Citation
