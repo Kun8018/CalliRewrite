@@ -45,9 +45,9 @@ class FrankaCalligraphySimulator:
             camera_elevation: 相机仰角
         """
         if model_path is None:
-            # 默认使用当前目录的模型
+            # 默认使用真实的FR3v2模型
             current_dir = Path(__file__).parent
-            model_path = current_dir / "models" / "franka_panda.xml"
+            model_path = current_dir / "models" / "franka_fr3v2_calligraphy.xml"
 
         self.model_path = str(model_path)
         self.render_mode = render_mode
@@ -98,7 +98,9 @@ class FrankaCalligraphySimulator:
     def _init_canvas(self):
         """初始化画布"""
         self.paper_canvas = np.ones(self.canvas_resolution, dtype=np.uint8) * 255
-        self.paper_offset = np.array([0.5, 0.0])  # 纸张在世界坐标的偏移
+        # 纸张中心在世界坐标 (0.5, 0, 0.01)，尺寸为 0.3 x 0.42
+        # 所以纸张左下角在世界坐标 (0.5 - 0.15, 0 - 0.21) = (0.35, -0.21)
+        self.paper_offset = np.array([0.35, -0.21])  # 纸张左下角的世界坐标
 
     def reset(self, qpos: Optional[np.ndarray] = None):
         """
@@ -249,8 +251,8 @@ class FrankaCalligraphySimulator:
         """更新笔迹记录"""
         brush_pos, contact_force = self.get_brush_contact()
 
-        # 记录轨迹
-        is_contact = contact_force > 0.01  # 接触阈值
+        # 记录轨迹 - 降低接触阈值以提高灵敏度
+        is_contact = contact_force > 0.0001  # 从0.01降低到0.0001
         self.ink_traces.append((*brush_pos, is_contact))
 
         # 如果接触，绘制到画布
@@ -259,13 +261,13 @@ class FrankaCalligraphySimulator:
 
     def _draw_on_canvas(self, pos: np.ndarray):
         """在画布上绘制"""
-        # 转换到画布坐标
+        # 转换到画布坐标（相对于纸张左下角）
         paper_x = pos[0] - self.paper_offset[0]
         paper_y = pos[1] - self.paper_offset[1]
 
-        # 归一化到 [0, 1]
-        u = (paper_x / self.paper_size[0] + 0.5)  # 中心对齐
-        v = (paper_y / self.paper_size[1] + 0.5)
+        # 归一化到 [0, 1] - 直接除以纸张尺寸，不需要中心对齐
+        u = paper_x / self.paper_size[0]
+        v = paper_y / self.paper_size[1]
 
         # 转换到像素坐标
         px = int(u * self.canvas_resolution[0])
@@ -273,8 +275,19 @@ class FrankaCalligraphySimulator:
 
         # 边界检查
         if 0 <= px < self.canvas_resolution[0] and 0 <= py < self.canvas_resolution[1]:
-            # 绘制笔画 (简单的圆点)
-            cv2.circle(self.paper_canvas, (px, py), 3, 0, -1)
+            # 绘制笔画 - 增加笔画粗细从3到8像素
+            cv2.circle(self.paper_canvas, (px, py), 8, 0, -1)
+
+            # 如果有上一个点，画线连接以确保连续性
+            if hasattr(self, '_last_canvas_pos'):
+                last_px, last_py = self._last_canvas_pos
+                cv2.line(self.paper_canvas, (last_px, last_py), (px, py), 0, 16)
+
+            self._last_canvas_pos = (px, py)
+        else:
+            # 如果超出边界，重置上一个位置
+            if hasattr(self, '_last_canvas_pos'):
+                delattr(self, '_last_canvas_pos')
 
     def execute_trajectory(
         self, npz_path: str, speed: float = 0.05, render: bool = True
@@ -310,12 +323,20 @@ class FrankaCalligraphySimulator:
         # 逐点执行
         start_time = time.time()
         for i in range(num_points):
-            target_pos = np.array([x[i], y[i], z[i]])
+            # NPZ坐标是相对于纸张的，需要转换到世界坐标系
+            # 纸张表面在世界坐标 Z = 0.01 + 0.001 = 0.011 (纸张中心0.01 + 厚度一半0.001)
+            # NPZ中Z=0对应纸张表面，Z<0表示压入纸张
+            target_pos = np.array([
+                x[i] + self.paper_offset[0],  # 加上X偏移
+                y[i] + self.paper_offset[1],  # 加上Y偏移
+                z[i] + 0.011  # Z坐标加上纸张表面高度
+            ])
 
             if i % 10 == 0:
                 print(
                     f"Progress: {i}/{num_points} ({i/num_points*100:.1f}%) - "
-                    f"Target: [{x[i]:.4f}, {y[i]:.4f}, {z[i]:.4f}]"
+                    f"NPZ: [{x[i]:.4f}, {y[i]:.4f}, {z[i]:.4f}] → "
+                    f"World: [{target_pos[0]:.4f}, {target_pos[1]:.4f}, {target_pos[2]:.4f}]"
                 )
 
             self.move_to_position(target_pos, speed=speed)

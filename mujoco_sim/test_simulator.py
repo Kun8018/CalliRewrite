@@ -132,9 +132,9 @@ def test_contact_detection(sim):
 
 
 def test_simple_trajectory(sim):
-    """测试 4: 简单轨迹执行"""
+    """测试 4: 简单轨迹执行（带视频录制）"""
     print("\n" + "="*60)
-    print("测试 4: 简单轨迹执行（画一条直线）")
+    print("测试 4: 简单轨迹执行（画一条直线）+ 视频录制")
     print("="*60)
 
     try:
@@ -155,15 +155,35 @@ def test_simple_trajectory(sim):
         print(f"X 范围: [{x.min():.3f}, {x.max():.3f}] m")
         print(f"Z 范围: [{z.min():.3f}, {z.max():.3f}] m")
 
-        # 执行轨迹
+        # 设置俯视相机视角（从机器人上方看下来）
+        import mujoco
+
+        print("\n开始录制视频（俯视角度）...")
+
+        # 创建离屏渲染器
+        renderer = mujoco.Renderer(sim.model, height=720, width=1280)
+
+        # 获取俯视相机ID
+        camera_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_CAMERA, "top_view")
+
+        # 初始化视频录制
+        frames = []
+
+        # 执行轨迹并录制
         for i in range(num_points):
             target = np.array([x[i], y[i], z[i]])
             sim.move_to_position(target, speed=0.1, wait_time=0.0)
+
+            # 渲染当前帧（俯视角度）
+            renderer.update_scene(sim.data, camera=camera_id)
+            pixels = renderer.render()
+            frames.append(pixels)
 
             if i % 5 == 0:
                 print(f"  进度: {i}/{num_points}")
 
         print(f"✅ 轨迹执行完成!")
+        print(f"   录制帧数: {len(frames)}")
 
         # 检查笔迹
         if len(sim.ink_traces) > 0:
@@ -178,6 +198,23 @@ def test_simple_trajectory(sim):
         canvas_path = "outputs/test_result.png"
         cv2.imwrite(canvas_path, sim.paper_canvas)
         print(f"   画布已保存: {canvas_path}")
+
+        # 保存视频
+        if len(frames) > 0:
+            try:
+                import imageio
+                video_path = "outputs/test_trajectory.mp4"
+                imageio.mimsave(video_path, frames, fps=30)
+                print(f"   视频已保存: {video_path}")
+
+                # 获取视频文件大小
+                video_size = os.path.getsize(video_path) / 1024  # KB
+                print(f"   视频大小: {video_size:.1f} KB")
+            except ImportError:
+                print("   ⚠️  imageio 未安装，跳过视频保存")
+                print("   安装方法: pip install imageio imageio-ffmpeg")
+            except Exception as e:
+                print(f"   ⚠️  视频保存失败: {e}")
 
         return True
 
