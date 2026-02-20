@@ -16,7 +16,7 @@ from mujoco_simulator import FrankaCalligraphySimulator
 
 def generate_composite_video(npz_path, output_video, speed=0.05, fps=30,
                             canvas_scale=0.4, canvas_position="bottom_right",
-                            frames_per_point=1):
+                            frames_per_point=1, camera_name="top_view"):
     """
     生成复合视频（机器人 + 画布叠加）
 
@@ -63,6 +63,10 @@ def generate_composite_video(npz_path, output_video, speed=0.05, fps=30,
         sim.ink_traces.append((*brush_pos, is_contact))
         if is_contact:
             sim._draw_on_canvas(brush_pos)
+        else:
+            # 笔抬起时重置连线起点，避免跨笔画连线
+            if hasattr(sim, '_last_canvas_pos'):
+                delattr(sim, '_last_canvas_pos')
     sim._update_ink_trace = patched_update
 
     # 创建离屏渲染器
@@ -70,9 +74,9 @@ def generate_composite_video(npz_path, output_video, speed=0.05, fps=30,
     print(f"创建离屏渲染器 ({video_width}x{video_height})...")
     renderer = mujoco.Renderer(sim.model, height=video_height, width=video_width)
 
-    # 获取俯视相机ID
-    camera_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_CAMERA, "top_view")
-    print(f"✅ 使用相机: top_view (ID={camera_id})\n")
+    # 获取相机ID
+    camera_id = mujoco.mj_name2id(sim.model, mujoco.mjtObj.mjOBJ_CAMERA, camera_name)
+    print(f"✅ 使用相机: {camera_name} (ID={camera_id})\n")
 
     # 初始化视频录制
     frames = []
@@ -81,10 +85,15 @@ def generate_composite_video(npz_path, output_video, speed=0.05, fps=30,
     # 执行轨迹并录制
     for i in range(num_points):
         # NPZ坐标是相对于纸张的，需要转换到世界坐标系
+        # Z坐标变换：NPZ z=0对应纸张表面(world z=0.011)，z>0表示抬起，z<0表示按压
+        # 按压时夹紧到纸张表面-笔刷半径处(0.008)，让物理仿真产生接触力
+        # 不夹紧的话IK会尝试到达地面以下(如z=-0.085)，求解失败导致机器人不动
+        z_world = z[i] + 0.011  # 纸张表面偏移
+        z_clamped = max(z_world, 0.008)  # 夹紧：按压时笔刷中心最低到0.008m
         target_pos = np.array([
             x[i] + sim.paper_offset[0],
             y[i] + sim.paper_offset[1],
-            z[i]
+            z_clamped
         ])
 
         # 移动到目标位置
@@ -230,6 +239,20 @@ if __name__ == "__main__":
         print(f"❌ 错误: 文件不存在: {args.npz_file}")
         sys.exit(1)
 
-    # 生成复合视频
-    generate_composite_video(args.npz_file, args.output, args.speed, args.fps,
-                           args.canvas_scale, args.canvas_position, args.slow)
+    # 生成两个视角的复合视频
+    cameras = [
+        ("side_view", "_side"),
+        ("front_view", "_front"),
+    ]
+
+    for camera_name, suffix in cameras:
+        # 构造输出文件名
+        base_name = args.output.replace('.mp4', '')
+        output_path = f"{base_name}{suffix}.mp4"
+
+        print(f"\n{'='*70}")
+        print(f"生成 {camera_name} 视角视频")
+        print(f"{'='*70}\n")
+
+        generate_composite_video(args.npz_file, output_path, args.speed, args.fps,
+                               args.canvas_scale, args.canvas_position, args.slow, camera_name)

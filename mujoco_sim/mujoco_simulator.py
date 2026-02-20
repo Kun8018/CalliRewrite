@@ -154,11 +154,17 @@ class FrankaCalligraphySimulator:
 
         return position, touch_value
 
+    # Home 位姿（无碰撞的标准姿态，用于零空间优化）
+    HOME_QPOS = np.array([0.0, 0.0, 0.0, -1.57079, 0.0, 1.57079, -0.7853])
+
     def inverse_kinematics(
-        self, target_pos: np.ndarray, max_iter: int = 100, tol: float = 1e-3
+        self, target_pos: np.ndarray, max_iter: int = 200, tol: float = 1e-3
     ) -> bool:
         """
-        逆运动学求解 (简化版，使用 MuJoCo 内置求解器)
+        逆运动学求解 - 带零空间优化，利用冗余自由度向 home 位姿靠拢以规避自碰撞
+
+        FR3v2 是 7DOF 机器人，求解 3D 位置只需 3 个约束，剩余 4 个自由度
+        构成零空间，可用于在不影响末端位置的情况下优化关节构型。
 
         Args:
             target_pos: (3,) 目标位置
@@ -170,6 +176,10 @@ class FrankaCalligraphySimulator:
         """
         ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "ee_site")
 
+        # 零空间优化增益：将关节拉向 home 位姿
+        # 注意：此值必须远小于主任务增益(0.5)，否则会妨碍末端位置收敛
+        null_gain = 0.01
+
         for _ in range(max_iter):
             # 当前末端位置
             current_pos = self.data.site_xpos[ee_site_id]
@@ -179,17 +189,37 @@ class FrankaCalligraphySimulator:
             if np.linalg.norm(error) < tol:
                 return True
 
-            # 计算雅可比矩阵
+            # 计算雅可比矩阵（只取前7个关节自由度）
             jacp = np.zeros((3, self.model.nv))
             jacr = np.zeros((3, self.model.nv))
             mujoco.mj_jacSite(self.model, self.data, jacp, jacr, ee_site_id)
+            J = jacp[:, :7]
 
-            # 伪逆求解
-            J = jacp
-            dq = np.linalg.pinv(J) @ error * 0.5  # 阻尼因子
+            # 伪逆求解主任务
+            J_pinv = np.linalg.pinv(J)
+            dq_primary = J_pinv @ error * 0.5
+
+            # 零空间项：把关节角拉向 home 位姿，降低自碰撞风险
+            # null_proj = (I - J⁺J)，零空间投影矩阵
+            null_proj = np.eye(7) - J_pinv @ J
+            q_err_to_home = self.HOME_QPOS - self.data.qpos[:7]
+            dq_null = null_proj @ (q_err_to_home * null_gain)
+
+            # 合并更新
+            dq = dq_primary + dq_null
 
             # 更新关节角度
-            self.data.qpos[:7] += dq[:7]
+            self.data.qpos[:7] += dq
+
+            # 夹紧到关节限位
+            for j in range(7):
+                joint_id = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_JOINT, f"fr3v2_joint{j+1}"
+                )
+                qmin = self.model.jnt_range[joint_id, 0]
+                qmax = self.model.jnt_range[joint_id, 1]
+                self.data.qpos[j] = np.clip(self.data.qpos[j], qmin, qmax)
+
             mujoco.mj_forward(self.model, self.data)
 
         return False
@@ -255,9 +285,12 @@ class FrankaCalligraphySimulator:
         is_contact = contact_force > 0.0001  # 从0.01降低到0.0001
         self.ink_traces.append((*brush_pos, is_contact))
 
-        # 如果接触，绘制到画布
+        # 如果接触，绘制到画布；否则重置连线起点，避免跨笔画连线
         if is_contact:
             self._draw_on_canvas(brush_pos)
+        else:
+            if hasattr(self, '_last_canvas_pos'):
+                delattr(self, '_last_canvas_pos')
 
     def _draw_on_canvas(self, pos: np.ndarray):
         """在画布上绘制"""
@@ -323,13 +356,14 @@ class FrankaCalligraphySimulator:
         # 逐点执行
         start_time = time.time()
         for i in range(num_points):
-            # NPZ坐标是相对于纸张的，需要转换到世界坐标系
-            # 纸张表面在世界坐标 Z = 0.01 + 0.001 = 0.011 (纸张中心0.01 + 厚度一半0.001)
-            # NPZ中Z=0对应纸张表面，Z<0表示压入纸张
+            # Z坐标变换：NPZ z=0对应纸张表面，z<0表示按压，z>0表示抬起
+            # 夹紧防止IK尝试到达地面以下导致求解失败
+            z_world = z[i] + 0.011
+            z_clamped = max(z_world, 0.008)  # 笔刷中心最低到0.008m
             target_pos = np.array([
-                x[i] + self.paper_offset[0],  # 加上X偏移
-                y[i] + self.paper_offset[1],  # 加上Y偏移
-                z[i] + 0.011  # Z坐标加上纸张表面高度
+                x[i] + self.paper_offset[0],
+                y[i] + self.paper_offset[1],
+                z_clamped
             ])
 
             if i % 10 == 0:

@@ -83,7 +83,7 @@
         <geom type="mesh" group="2" contype="0" conaffinity="0"/>
       </default>
       <default class="collision">
-        <geom type="mesh" group="3" mass="0" density="0"/>
+        <geom type="mesh" group="3" mass="0" density="0" contype="1" conaffinity="1"/>
       </default>
       <site size="0.001" rgba="0.5 0.5 0.5 0.3" group="4"/>
     </default>
@@ -91,15 +91,18 @@
 
   <worldbody>
     <light pos="0 0 3" dir="0 0 -1" directional="true"/>
-    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" contype="1" conaffinity="1"/>
 
-    <!-- Camera for 45-degree angled view from side-top -->
-    <!-- 从侧边45度角从上往下看机器人和纸张，机器人上下左右居中 -->
-    <camera name="top_view" pos="0.3 -0.5 0.6" euler="1.05 0 0" fovy="65"/>
+    <!-- Camera 1: side view (R2_x07) -->
+    <camera name="side_view" pos="0.7 -0.9 0.65" euler="0.9 0 0" fovy="60"/>
+    <!-- Camera 2: diagonal front view (V2) -->
+    <camera name="front_view" pos="0.5 -0.70 0.55" euler="0.68 0 0" fovy="60"/>
+    <!-- Default camera (same as side_view) -->
+    <camera name="top_view" pos="0.7 -0.9 0.65" euler="0.9 0 0" fovy="60"/>
 
     <!-- Paper surface for calligraphy -->
     <body name="paper" pos="0.5 0 0.01">
-      <geom name="paper_surface" type="box" size="0.15 0.21 0.001" material="paper" friction="1.2 0.005 0.0001"/>
+      <geom name="paper_surface" type="box" size="0.15 0.21 0.001" material="paper" friction="1.2 0.005 0.0001" contype="2" conaffinity="2"/>
       <site name="paper_center" pos="0 0 0.001" size="0.005" rgba="0 0 1 0.3"/>
     </body>
 
@@ -189,17 +192,17 @@
                     <!-- End effector with brush -->
                     <body name="end_effector" pos="0 0 0.107">
                       <inertial pos="0 0 0.02" mass="0.3" diaginertia="0.0005 0.0005 0.0005"/>
-                      <geom name="ee_mount" type="cylinder" size="0.03 0.02" rgba="0.3 0.3 0.3 1"/>
+                      <geom name="ee_mount" type="cylinder" size="0.03 0.02" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0"/>
 
                       <!-- Brush holder -->
                       <body name="brush_holder" pos="0 0 0.02">
                         <inertial pos="0 0 0.05" mass="0.1" diaginertia="0.0001 0.0001 0.0001"/>
-                        <geom name="holder" type="cylinder" size="0.008 0.05" rgba="0.2 0.2 0.2 1"/>
+                        <geom name="holder" type="cylinder" size="0.008 0.05" rgba="0.2 0.2 0.2 1" contype="0" conaffinity="0"/>
 
                         <!-- Brush tip (contact point) -->
                         <body name="brush_tip" pos="0 0 0.05">
                           <inertial pos="0 0 0.025" mass="0.05" diaginertia="0.00001 0.00001 0.00001"/>
-                          <geom name="brush" type="sphere" size="0.003" rgba="0 0 0 1"/>
+                          <geom name="brush" type="sphere" size="0.003" rgba="0 0 0 1" contype="2" conaffinity="2"/>
                           <site name="brush_contact" pos="0 0 0" size="0.002" rgba="1 0 0 0.5"/>
                           <site name="ee_site" pos="0 0 0" size="0.002" rgba="0 1 0 0.5"/>
                         </body>
