@@ -2,7 +2,39 @@
 
 ## 🎯 训练概览
 
-**两阶段训练流程:**
+**三种训练方案:**
+
+### 🚀 方案 1: 快速开始（推荐，无需训练）
+
+```
+书法图像
+   ↓
+骨架提取 (extract_dense_trajectory.py)
+   ↓ 输出: .npz 文件 (秒级)
+MuJoCo 仿真 / 机器人控制
+```
+
+**优势:** ⚡ 无需 GPU | ⚡ 即时生成 | ⚡ 节省资源
+
+---
+
+### ⚡ 方案 2: 跳过 Phase 1（推荐，需要 GPU）
+
+```
+预训练 Phase 1 模型
+   ↓
+Phase 1-2: 书法微调 (2-3天, V100)
+   ↓ 输出: .npy 文件
+rl_finetune: RL 优化 (1-2天, V100)
+   ↓ 输出: 优化后 .npy 文件
+转换为 .npz → MuJoCo / 机器人
+```
+
+**优势:** ✅ 节省 5 天训练时间 | ✅ 无需 QuickDraw 数据 | ✅ 高质量笔画
+
+---
+
+### 🔬 方案 3: 完整训练（研究用途）
 
 ```
 阶段1: seq_extract (TensorFlow LSTM)
@@ -12,7 +44,10 @@
 阶段2: rl_finetune (PyTorch SAC)
 └─ RL 优化笔画参数 (1-2天, V100)
      ↓ 输出: 优化后 .npy 文件
+转换为 .npz → MuJoCo / 机器人
 ```
+
+**优势:** 🎓 完全可控 | 🎓 适合研究改进 | 🎓 自定义数据集
 
 ---
 
@@ -48,7 +83,246 @@ nvidia-smi
 
 ---
 
-## 🔧 阶段1: seq_extract 训练
+## ⚡ 快速开始：跳过 Phase 1（推荐）
+
+**如果你只想生成书法笔画，不需要从头训练整个模型！**
+
+### 为什么跳过 Phase 1？
+
+| 方案 | 时间 | 需要数据 | 优势 |
+|------|------|----------|------|
+| **完整训练** | ~7-8 天 | QuickDraw (几十GB) + 书法数据 | 完全可控 |
+| **跳过 Phase 1** | ~2-3 天 | 只需书法数据 | 节省时间和存储 |
+
+### 步骤 1: 获取预训练模型
+
+**选项 A: 从项目作者获取**
+
+联系项目作者或查找 GitHub Release：
+
+```bash
+# 假设下载了预训练模型
+# pretrained_phase1_model.zip (约 500MB)
+
+# 解压到 seq_extract/outputs/snapshot/
+cd /path/to/CalliRewrite/seq_extract
+mkdir -p outputs/snapshot/pretrained_phase_1
+unzip pretrained_phase1_model.zip -d outputs/snapshot/pretrained_phase_1/
+```
+
+**选项 B: 使用第三方预训练模型**
+
+如果项目没有提供，可以：
+1. 在 GitHub Issues 中询问作者
+2. 在相关论文的页面查找模型链接
+3. 使用类似项目的预训练模型（风险：可能不兼容）
+
+**选项 C: 使用骨架提取方法（无需训练）**
+
+如果找不到预训练模型，使用 `mujoco_sim/extract_dense_trajectory.py`：
+
+```bash
+cd /path/to/CalliRewrite/mujoco_sim
+
+# 直接从图像生成 NPZ（不需要 LSTM）
+python extract_dense_trajectory.py \
+  sample_inputs/calligraphy/永.png \
+  --output demo_outputs/永_dense.npz \
+  --size 0.12 \
+  --depth -0.002
+```
+
+---
+
+### 步骤 2: 准备书法数据集
+
+创建 `seq_extract/datasets/2000/` 目录：
+
+```bash
+cd /path/to/CalliRewrite/seq_extract
+mkdir -p datasets/2000
+
+# 目录结构:
+# datasets/2000/
+# ├── 0.png     # 书法图像 (256x256)
+# ├── 1.png
+# ├── 2.png
+# └── ...
+```
+
+**数据要求：**
+- 图像尺寸：256×256 像素
+- 格式：PNG/JPG
+- 内容：黑底白字 或 白底黑字（代码会自动处理）
+- 数量：建议 500-2000 张
+
+**数据来源：**
+1. 手写扫描（拍照后裁剪缩放）
+2. 书法字体库（字体转图像）
+3. 在线书法作品（爬虫获取）
+
+---
+
+### 步骤 3: 配置 Phase 2 训练
+
+编辑 `seq_extract/hyper_parameters.py`：
+
+```python
+def get_default_hparams_phase_2():
+    hparams = dict(
+        program_name='my_train_phase_2',      # 你的实验名
+        data_set='gb',                         # 使用书法数据集
+
+        num_steps=30020,                       # 训练步数
+        batch_size=12,                         # 根据 GPU 调整
+        save_every=5000,
+
+        # ⚠️ 关键：指定预训练模型路径
+        pretrained_model='outputs/snapshot/pretrained_phase_1/model-90000',
+
+        # 其他参数保持默认
+        ...
+    )
+```
+
+**如果没有预训练模型**，可以修改 `train_phase_2.py` 从头训练（但效果会差）：
+
+```python
+# 在 train_phase_2.py 中注释掉加载预训练模型的代码
+# 或设置 pretrained_model=None
+```
+
+---
+
+### 步骤 4: 安装环境
+
+**推荐配置（兼容性更好）：**
+
+```bash
+cd /path/to/CalliRewrite/seq_extract
+
+# 创建 Python 3.9 环境
+conda create -n CalliRewrite python=3.9 -y
+conda activate CalliRewrite
+
+# 使用清华镜像安装 TensorFlow 2.12（更容易获取）
+pip install tensorflow==2.12.0 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 安装其他依赖
+pip install numpy==1.24.4 scipy matplotlib opencv-python pillow \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+pip install cairocffi gizeh tensorboard \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 验证 GPU
+python -c "import tensorflow as tf; print(tf.__version__); print(tf.config.list_physical_devices('GPU'))"
+```
+
+---
+
+### 步骤 5: 启动 Phase 2 训练
+
+```bash
+cd /path/to/CalliRewrite/seq_extract
+conda activate CalliRewrite
+
+# 后台运行
+nohup python train_phase_2.py > train_phase2.log 2>&1 &
+
+# 或使用 tmux（推荐）
+tmux new -s train_phase2
+python train_phase_2.py
+# Ctrl+B, D 分离
+
+# 查看日志
+tail -f train_phase2.log
+```
+
+**TensorBoard 监控：**
+
+```bash
+# 在远程服务器
+tensorboard --logdir=outputs/log/my_train_phase_2
+
+# 本地电脑（SSH 端口转发）
+ssh -L 6006:localhost:6006 user@remote_server
+
+# 浏览器打开: http://localhost:6006
+```
+
+---
+
+### 步骤 6: 推理生成 .npy
+
+训练完成后（~2-3 天），生成笔画序列：
+
+```bash
+cd /path/to/CalliRewrite/seq_extract
+
+# 单张图像推理
+python test.py \
+  --input_image sample_inputs/calligraphy/永.png \
+  --output_npy outputs/永.npy \
+  --model_path outputs/snapshot/my_train_phase_2/model-30000
+
+# 批量推理
+python test.py \
+  --input_dir sample_inputs/calligraphy/ \
+  --output_dir outputs/npy_results/ \
+  --model_path outputs/snapshot/my_train_phase_2/model-30000
+```
+
+---
+
+### 步骤 7: RL 微调（可选）
+
+如果想进一步优化，继续训练 rl_finetune：
+
+```bash
+cd /path/to/CalliRewrite/rl_finetune
+
+# 复制 Phase 2 生成的 .npy 到 rl_finetune 数据目录
+cp /path/to/seq_extract/outputs/npy_results/*.npy data/train_data/
+
+# 确保有对应的图像
+cp /path/to/calligraphy_images/*.png data/train_data/
+
+# 训练
+bash scripts/train_brush.sh
+```
+
+---
+
+## 📊 时间对比
+
+| 阶段 | 完整训练 | 跳过 Phase 1 |
+|------|----------|--------------|
+| Phase 1-1 (QuickDraw) | ~5 天 | ❌ 跳过 |
+| Phase 1-2 (书法微调) | ~3 天 | ✅ 只训练这个 (~2.5 天) |
+| Phase 2 (RL 优化) | ~1.5 天 | ~1.5 天 |
+| **总计** | **~9.5 天** | **~4 天** |
+
+---
+
+## 🎓 快速开始检查清单
+
+- [ ] 获取预训练 Phase 1 模型（或使用骨架提取）
+- [ ] 准备 500-2000 张书法图像（256×256）
+- [ ] 创建 conda 环境 `CalliRewrite`
+- [ ] 验证 TensorFlow GPU 可用
+- [ ] 修改 `hyper_parameters.py` 指定预训练模型
+- [ ] 启动 Phase 2 训练（后台运行）
+- [ ] TensorBoard 监控
+- [ ] 等待训练完成 (~2.5 天)
+- [ ] 使用 `test.py` 生成 .npy 文件
+
+---
+
+## 🔧 阶段1: seq_extract 完整训练（仅当需要时）
+
+**⚠️ 如果你已经跳过 Phase 1，可以忽略下面的内容！**
 
 ### 步骤 1: 创建 Conda 环境
 
@@ -530,6 +804,112 @@ python train_phase_1.py  # 自动检测并恢复
 # rl_finetune 需要手动指定
 python try_tianshou.py --resume_path result/brush/models/epoch_5_actor.pth
 ```
+
+### 问题 4: 找不到预训练的 Phase 1 模型
+
+**解决方案 A: 联系作者**
+
+```bash
+# 在 GitHub 上开 Issue 询问
+# 标题: Request for Pre-trained Phase 1 Model
+# 说明你想跳过 QuickDraw 训练，只做书法微调
+```
+
+**解决方案 B: 使用骨架提取（推荐，无需训练）**
+
+```bash
+cd /path/to/CalliRewrite/mujoco_sim
+
+# 从图像直接生成 NPZ
+python extract_dense_trajectory.py \
+  your_calligraphy_image.png \
+  --output result.npz \
+  --size 0.12 \
+  --depth -0.002
+```
+
+**解决方案 C: 使用公开数据集预训练模型**
+
+- 搜索类似项目（如 SketchRNN, Pix2Seq）
+- 检查 Papers with Code 是否有相关模型
+- 尝试 Hugging Face Model Hub
+
+### 问题 5: conda install cudatoolkit 报错
+
+**错误信息：**
+```
+CondaHTTPError: HTTP 000 CONNECTION FAILED
+```
+
+**解决方案：使用清华镜像源**
+
+```bash
+# 添加清华镜像
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
+conda config --set show_channel_urls yes
+
+# 重新安装
+conda install cudatoolkit=11.8 cudnn=8.8 -y
+```
+
+**或者跳过 cudatoolkit（推荐）：**
+
+```bash
+# TensorFlow 2.12+ 已内置 CUDA，不需要单独安装
+pip install tensorflow==2.12.0 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 问题 6: pip 下载 TensorFlow 很慢或中断
+
+**解决方案：使用国内镜像**
+
+```bash
+# 清华源（推荐）
+pip install tensorflow==2.12.0 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --trusted-host pypi.tuna.tsinghua.edu.cn
+
+# 增加超时和重试
+pip install tensorflow==2.12.0 \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --timeout 600 --retries 10
+```
+
+**或者手动下载后安装：**
+
+```bash
+# 在本地下载 .whl 文件
+# 访问 https://pypi.org/project/tensorflow/2.12.0/#files
+
+# 上传到远程服务器
+scp tensorflow-2.12.0-*.whl user@server:~/
+
+# 在服务器安装
+pip install ~/tensorflow-2.12.0-*.whl
+```
+
+### 问题 7: 没有 QuickDraw 数据怎么办
+
+**方案 1: 跳过 Phase 1-1（推荐）**
+
+直接使用预训练模型或骨架提取方法，见上面的"快速开始"章节。
+
+**方案 2: 下载 QuickDraw 数据**
+
+```bash
+# 从 Google 官方下载（需要翻墙）
+# https://github.com/googlecreativelab/quickdraw-dataset
+
+# 下载特定类别的 .npy 格式
+wget https://storage.googleapis.com/quickdraw_dataset/full/numpy_bitmap/airplane.npy
+
+# 需要下载的类别（参考 dataset_utils.py）:
+# airplane, bus, car, sailboat, bird, cat, dog, tree, flower, zigzag
+```
+
+**数据量大小：** 每个类别约 1-5 GB，总计约 20-50 GB
 
 ---
 
