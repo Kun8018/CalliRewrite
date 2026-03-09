@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.DS_Store
+*.npz
+*.npy
+*.mp4
+*.egg-info/
+dist/
+build/
+.env
