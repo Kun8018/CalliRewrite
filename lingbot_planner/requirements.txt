@@ -1,0 +1,19 @@
+# lingbot_planner 依赖
+# CalliRewrite + LingBot-VLA 上层规划器集成
+#
+# 轻量依赖（本模块直接使用）：
+requests>=2.31.0      # LingBot-VLA 服务器 HTTP 通信
+Pillow>=10.0.0        # 相机图像编码（base64 → JPEG → 服务器）
+numpy>=1.24.0         # 数组处理
+
+# CalliRewrite 核心依赖（已在项目中安装）：
+# opencv-python        # 图像读写
+# scikit-image         # skeletonize（extract_from_order_v2.py）
+# mujoco               # 仿真（仿真模式需要）
+
+# LingBot-VLA 服务器依赖（需在 GPU 机器单独安装）：
+# 参考 https://github.com/Robbyant/lingbot-vla#installation
+# torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+# transformers
+# lerobot (commit 0cf864870cf29f4738d3ade893e6fd13fbd7cdb5)
+# flash-attn (CUDA 12.8 wheel)
