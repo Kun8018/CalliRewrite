@@ -12,9 +12,9 @@ default_acceleration: 0.05   # Acceleration factor (0.0-1.0)
 # Workspace Definition
 # Define the center of your writing surface in robot base frame coordinates
 workspace_center:
-  x: 0.4    # meters from robot base (forward)
-  y: 0.0    # meters from robot base (left/right)
-  z: 0.2    # meters from robot base (height of paper surface)
+  x: 0.668    # meters from robot base (forward)
+  y: 0.0443    # meters from robot base (left/right)
+  z: 0.2331    # meters from robot base (height of paper surface)
 
 # Safety Limits (relative to workspace_center)
 safety:

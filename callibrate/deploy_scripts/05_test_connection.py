@@ -52,26 +52,74 @@ def ping_test(ip):
         return False
 
 
+def _franky_version_hint(sv):
+    """根据 FCI server version 返回对应的 libfranka wheel 版本"""
+    table = {'9': '0-16-1', '8': '0-14-1', '7': '0-13-3',
+             '6': '0-10-0', '5': '0-9-2',  '4': '0-8-0'}
+    return table.get(str(sv))
+
+
 def franka_connect_test(ip):
+    import re
     print(f'\n[2] Franka 库连接测试: {ip}')
     sys.path.insert(0, ROOT)
 
-    # 尝试 franky
+    # ── 尝试 franky（pip install franky-control） ──────────────────
     try:
         import franky
         print('  使用 franky...')
-        robot = franky.Robot(ip)
+
+        # 兼容不同版本：Robot / Franka / FrankaRobot
+        RobotCls = None
+        for name in ('Robot', 'Franka', 'FrankaRobot'):
+            RobotCls = getattr(franky, name, None)
+            if RobotCls is not None:
+                break
+
+        if RobotCls is None:
+            avail = [x for x in dir(franky) if not x.startswith('_')]
+            print(f'  ❌ franky 模块中找不到 Robot 类')
+            print(f'     当前可用: {avail}')
+            print(f'     → 请升级: pip install -U franky-control')
+            return False
+
+        robot = RobotCls(ip)
         print(f'  ✅ franky 连接成功！')
-        print(f'     机器人状态: 已连接')
         del robot
         return True
+
     except ImportError:
-        pass
+        print('  ⚠️  franky 未安装 → pip install franky-control')
+
     except Exception as e:
-        print(f'  ❌ franky 连接失败: {e}')
+        err = str(e)
+        m = re.search(r'server version\s*(\d+).*?library version\s*(\d+)', err)
+        if m:
+            sv, lv = m.group(1), m.group(2)
+            hint = _franky_version_hint(sv)
+            print(f'  ❌ FCI 版本不匹配: 机器人 v{sv}，库 v{lv}')
+            print(f'\n  修复（安装兼容 FCI v{sv} 的 wheel）:')
+            print(f'    pip uninstall franky-control -y')
+            if hint:
+                print(f'    VERSION={hint}')
+                print(f'    wget https://github.com/TimSchneider42/franky/releases/latest'
+                      f'/download/libfranka_${{VERSION}}_wheels.zip')
+                print(f'    unzip libfranka_${{VERSION}}_wheels.zip')
+                print(f'    pip install --no-index --find-links=./dist franky-control')
+            else:
+                print(f'    # 到 https://github.com/TimSchneider42/franky/releases 选对应版本')
+        elif 'not ready' in err.lower() or 'locked' in err.lower():
+            print(f'  ❌ 机器人未解锁')
+            print(f'     → 打开 Franka Desk，点击解锁按钮，确认状态为 Ready')
+        else:
+            print(f'  ❌ franky 连接失败: {e}')
+            print(f'     常见原因:')
+            print(f'       1. Franka Desk 浏览器标签页未关闭（占用连接）')
+            print(f'       2. 机器人未解锁')
+            print(f'       3. IP 地址错误')
         return False
 
-    # 尝试 frankx
+    # ── 尝试 frankx（旧版备用） ────────────────────────────────────
     try:
         import frankx
         print('  使用 frankx...')
@@ -81,14 +129,14 @@ def franka_connect_test(ip):
         del robot
         return True
     except ImportError:
-        print('  ❌ 没有 franky 也没有 frankx')
-        print('     请运行: pip install frankx')
+        print('  ❌ franky 和 frankx 均未安装')
+        print('     → pip install franky-control')
         return False
     except Exception as e:
         print(f'  ❌ frankx 连接失败: {e}')
         print(f'     常见原因:')
         print(f'       1. 机器人在 Franka Desk 中未解锁')
-        print(f'       2. Franka Desk 仍然打开且占用连接（请关闭浏览器标签页）')
+        print(f'       2. Franka Desk 浏览器标签页仍打开（请关闭）')
         print(f'       3. IP 地址错误')
         return False
 

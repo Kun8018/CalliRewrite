@@ -190,11 +190,14 @@ class FrankaCalligraphyController:
 
         try:
             if self._library == "franky":
-                from franky import CartesianMotion, Affine
+                from franky import CartesianMotion, Affine, ReferenceType
 
-                # Create target pose
-                target = Affine(x, y, z)
-                motion = CartesianMotion(target)
+                # 读取当前末端姿态，保留朝向，仅替换位置
+                # 直接用 Affine 的 relative 方式：计算当前位置到目标的 delta
+                curr = self._robot.state.O_T_EE.translation
+                dx, dy, dz = x - float(curr[0]), y - float(curr[1]), z - float(curr[2])
+                target = Affine([dx, dy, dz])
+                motion = CartesianMotion(target, ReferenceType.Relative)
 
                 # Set speed
                 old_speed = self._robot.relative_dynamics_factor

@@ -43,10 +43,18 @@ def read_robot_pose(ip):
         import franky
         robot = franky.Robot(ip)
         state = robot.state
-        pose  = state.O_T_EE  # 4x4 齐次变换矩阵（末端在基坐标系中的位姿）
-        x = pose[0][3]
-        y = pose[1][3]
-        z = pose[2][3]
+        pose  = state.O_T_EE  # Affine 或 4x4 矩阵，取决于 franky 版本
+        # 新版 franky: pose 是 Affine 对象，有 .translation 属性
+        # 旧版 franky: pose 是 4x4 列表/数组，用 pose[0][3] 取 x
+        if hasattr(pose, 'translation'):
+            t = pose.translation
+            x, y, z = float(t[0]), float(t[1]), float(t[2])
+        elif hasattr(pose, 'x'):
+            x, y, z = float(pose.x), float(pose.y), float(pose.z)
+        else:
+            x = pose[0][3]
+            y = pose[1][3]
+            z = pose[2][3]
         del robot
         return x, y, z, 'franky'
     except ImportError:
