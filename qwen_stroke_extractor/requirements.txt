@@ -1,0 +1,20 @@
+# 基于千问Plus的笔画提取依赖
+# 注意：请根据你的硬件配置选择合适的torch版本
+
+# 核心依赖
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.35.0
+accelerate>=0.24.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# 阿里云DashScope API（如果使用API模式）
+dashscope>=1.14.0
+
+# 可视化（可选）
+matplotlib>=3.7.0
+opencv-python>=4.8.0
+
+# 提示：安装时可能需要指定torch的CUDA版本
+# 例如：pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
