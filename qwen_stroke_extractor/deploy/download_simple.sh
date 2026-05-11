@@ -1,28 +1,72 @@
 #!/bin/bash
 # 简单下载脚本 - 使用 HuggingFace Hub（不依赖 ModelScope）
-# 使用方法: bash download_simple.sh [Qwen-VL | Qwen-VL-Plus]
+# 使用方法: bash download_simple.sh [--mirror {hf-mirror|byte-trust|fastgit|hf.co}] [Qwen-VL | Qwen-VL-Plus]
 
 set -e
 
 echo "========================================"
-echo "简单下载（HuggingFace Hub + 镜像）"
+echo "简单下载（HuggingFace Hub + 可切换镜像）"
 echo "========================================"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 MODEL_DIR="$PROJECT_ROOT/qwen_stroke_extractor/models"
 
-# 选择模型
-if [ "$#" -eq 0 ]; then
-    echo "未指定模型，默认下载 Qwen-VL"
-    MODEL_NAME="Qwen-VL"
-else
-    MODEL_NAME="$1"
-fi
+# 默认参数
+MIRROR="hf-mirror"
+MODEL_NAME="Qwen-VL"
+
+# 解析参数
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --mirror)
+            if [ "$#" -gt 1 ]; then
+                case "$2" in
+                    hf-mirror)
+                        MIRROR="hf-mirror"
+                        ;;
+                    byte-trust)
+                        MIRROR="byte-trust"
+                        ;;
+                    fastgit)
+                        MIRROR="fastgit"
+                        ;;
+                    hf-co)
+                        MIRROR="hf.co"
+                        ;;
+                    *)
+                        echo "警告: 未知的镜像源 $2，使用默认的 hf-mirror"
+                        MIRROR="hf-mirror"
+                        ;;
+                esac
+                shift
+            else
+                echo "警告: --mirror 需要参数"
+            fi
+            shift
+            ;;
+        Qwen-VL|Qwen-VL-Plus)
+            MODEL_NAME="$1"
+            shift
+            ;;
+        *)
+            echo "警告: 未知参数 $1，忽略"
+            shift
+            ;;
+    esac
+done
+
+# 镜像配置
+declare -A MIRROR_CONFIGS
+MIRROR_CONFIGS["hf-mirror"]="https://hf-mirror.com"
+MIRROR_CONFIGS["byte-trust"]="https://hf-mirror.byte-trust.com"
+MIRROR_CONFIGS["fastgit"]="https://huggingface.co.fastgit.org"
+MIRROR_CONFIGS["hf-co"]="https://huggingface.co"
 
 echo "项目根目录: $PROJECT_ROOT"
 echo "模型存储路径: $MODEL_DIR"
 echo "准备下载: $MODEL_NAME"
+echo "使用镜像源: $MIRROR (${MIRROR_CONFIGS[$MIRROR]})"
 
 # 检查虚拟环境
 if [ -d "$PROJECT_ROOT/calli_train_env" ]; then
@@ -50,7 +94,7 @@ if [ -d "$MODEL_NAME" ]; then
 fi
 
 # 设置镜像加速
-export HF_ENDPOINT=https://hf-mirror.com
+export HF_ENDPOINT="${MIRROR_CONFIGS[$MIRROR]}"
 
 # 使用 Python 下载
 echo ""
@@ -61,7 +105,7 @@ from huggingface_hub import snapshot_download
 import os
 
 model_id = "Qwen/$MODEL_NAME"
-print(f"正在从 HuggingFace 镜像下载: {model_id}")
+print(f"正在从 {MIRROR} 下载: {model_id}")
 print()
 
 try:
