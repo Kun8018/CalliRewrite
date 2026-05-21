@@ -107,9 +107,10 @@ echo "开始批量处理..."
 echo "========================================"
 
 python3 <<END
-from qwen_stroke_extractor.extractor import create_extractor
-import os
 import sys
+import os
+sys.path.insert(0, "$PROJECT_ROOT")
+from qwen_stroke_extractor.extractor import create_extractor
 
 # 初始化提取器
 print("初始化提取器...")

@@ -48,13 +48,13 @@ if [ ! -f "requirements.txt" ]; then
 fi
 
 # 安装依赖
-pip install -r requirements.txt
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 安装额外的依赖
 echo ""
 echo "安装额外的依赖..."
-pip install dashscope  # 阿里云 SDK
-pip install modelscope  # ModelScope 下载工具（可选）
+pip install dashscope -i https://pypi.tuna.tsinghua.edu.cn/simple  # 阿里云 SDK
+pip install modelscope -i https://pypi.tuna.tsinghua.edu.cn/simple  # ModelScope 下载工具（可选）
 
 echo ""
 echo "========================================"

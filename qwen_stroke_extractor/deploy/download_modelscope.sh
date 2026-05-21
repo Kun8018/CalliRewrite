@@ -24,11 +24,11 @@ echo "模型存储路径: $MODEL_DIR"
 echo "准备下载: $MODEL_NAME"
 
 # 检查虚拟环境
-if [ -d "$PROJECT_ROOT/calli_train_env" ]; then
-    source "$PROJECT_ROOT/calli_train_env/bin/activate"
-elif [ -d "$PROJECT_ROOT/.venv" ]; then
-    source "$PROJECT_ROOT/.venv/bin/activate"
-fi
+# if [ -d "$PROJECT_ROOT/calli_train_env" ]; then
+#     source "$PROJECT_ROOT/calli_train_env/bin/activate"
+# elif [ -d "$PROJECT_ROOT/.venv" ]; then
+#     source "$PROJECT_ROOT/.venv/bin/activate"
+# fi
 
 # 确保 modelscope 已安装
 echo ""

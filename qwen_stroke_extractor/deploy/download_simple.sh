@@ -105,7 +105,7 @@ from huggingface_hub import snapshot_download
 import os
 
 model_id = "Qwen/$MODEL_NAME"
-print(f"正在从 {MIRROR} 下载: {model_id}")
+print(f"正在从 $MIRROR 下载: {model_id}")
 print()
 
 try:

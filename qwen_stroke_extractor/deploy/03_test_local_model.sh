@@ -86,8 +86,10 @@ echo "运行本地模型测试..."
 echo "========================================"
 
 python3 <<END
-from qwen_stroke_extractor.extractor import create_extractor
+import sys
 import os
+sys.path.insert(0, "$PROJECT_ROOT")
+from qwen_stroke_extractor.extractor import create_extractor
 
 print("初始化提取器...")
 extractor = create_extractor(

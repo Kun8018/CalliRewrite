@@ -53,15 +53,26 @@ if [ -d "$MODEL_NAME" ]; then
     echo "----------------------------------------"
     echo "如果已存在的模型不完整，请运行: rm -rf $MODEL_DIR/$MODEL_NAME"
     exit 0
+elif [ -d "qwen/$MODEL_NAME" ]; then
+    # 检查 ModelScope 的下载位置
+    echo "检测到 ModelScope 已下载的模型: qwen/$MODEL_NAME"
+    latest_version=$(ls -1 "qwen/$MODEL_NAME" | tail -1)
+    if [ -n "$latest_version" ]; then
+        actual_path="qwen/$MODEL_NAME/$latest_version"
+        echo "找到最新版本: $actual_path"
+        ln -sf "$actual_path" "$MODEL_NAME"
+        echo "已创建软链接: $MODEL_NAME"
+    fi
+    exit 0
 fi
 
 # 检查虚拟环境
-if [[ -z "${VIRTUAL_ENV}" ]]; then
-    if [ -d "$PROJECT_ROOT/calli_train_env" ]; then
-        echo "未激活虚拟环境，正在激活..."
-        source "$PROJECT_ROOT/calli_train_env/bin/activate"
-    fi
-fi
+# if [[ -z "${VIRTUAL_ENV}" ]]; then
+#    if [ -d "$PROJECT_ROOT/calli_train_env" ]; then
+#        echo "未激活虚拟环境，正在激活..."
+#       source "$PROJECT_ROOT/calli_train_env/bin/activate"
+#    fi
+#fi
 
 if [ "$USE_MODELSCOPE" = true ]; then
     echo ""
