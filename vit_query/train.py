@@ -13,7 +13,7 @@ import torch.optim as optim
 from torch.utils.data import random_split
 from tqdm import tqdm
 
-from model import ViTTrajectoryExtractor, ViTTrajectoryExtractor7D, count_parameters
+from model import ViTTrajectoryExtractor, ViTTrajectoryExtractor7D, ViTAutoregressiveExtractor7D, count_parameters
 from dataset import StrokeDatasetViT, QuickDrawCleanDatasetViT
 
 try:
@@ -71,6 +71,39 @@ class TrajectoryLoss7D(nn.Module):
         return {'total': total_loss, 'pen': pen_loss, 'coord': coord_loss, 'param': param_loss}
 
 
+class AutoregressiveTrajectoryLoss7D(nn.Module):
+    def __init__(self, weight_pen=1.0, weight_coord=5.0, weight_param=1.0):
+        super().__init__()
+        self.weight_pen = weight_pen
+        self.weight_coord = weight_coord
+        self.weight_param = weight_param
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
+        self.l1_loss = nn.L1Loss(reduction='none')
+
+    def forward(self, outputs, targets, mask=None):
+        predictions = outputs['seq']
+        pen_logits = outputs['pen_logits']
+        if mask is None:
+            mask = torch.ones_like(targets[..., 0])
+        mask_sum = mask.sum().clamp_min(1.0)
+
+        pen_loss = self.bce_loss(pen_logits, targets[..., 0])
+        pen_loss = (pen_loss * mask).sum() / mask_sum
+
+        coord_loss = self.l1_loss(predictions[..., 1:5], targets[..., 1:5])
+        coord_loss = (coord_loss.mean(dim=-1) * mask).sum() / mask_sum
+
+        param_loss = self.l1_loss(predictions[..., 5:7], targets[..., 5:7])
+        param_loss = (param_loss.mean(dim=-1) * mask).sum() / mask_sum
+
+        total_loss = (
+            self.weight_pen * pen_loss +
+            self.weight_coord * coord_loss +
+            self.weight_param * param_loss
+        )
+        return {'total': total_loss, 'pen': pen_loss, 'coord': coord_loss, 'param': param_loss}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train ViT Trajectory Extractor')
     parser.add_argument('--phase', type=int, default=1, choices=[1, 2],
@@ -91,6 +124,10 @@ def parse_args():
     parser.add_argument('--embed_dim', type=int, default=192)
     parser.add_argument('--mode', type=str, default='seq7', choices=['seq7', 'points'],
                         help='输出模式: seq7 或 points；两阶段建议用 seq7')
+    parser.add_argument('--arch', type=str, default='autoregressive', choices=['autoregressive', 'oneshot'],
+                        help='autoregressive=canvas/cursor 自回归主路径；oneshot=旧的一次性序列预测')
+    parser.add_argument('--chunk_len', type=int, default=8, help='autoregressive teacher-forcing chunk 长度')
+    parser.add_argument('--chunks_per_sample', type=int, default=4, help='每个样本每轮 epoch 的随机 chunk 数')
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--max_items_per_category', type=int, default=None,
@@ -109,15 +146,27 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
 
     for batch in pbar:
-        images = batch['image'].to(device)
         optimizer.zero_grad()
 
-        if model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+        if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
+            outputs = model.forward_teacher_forcing(
+                batch['target_mask'].to(device),
+                batch['canvases'].to(device),
+                batch['cursors'].to(device),
+                batch['prev_strokes'].to(device),
+                batch['step_indices'].to(device)
+            )
+            targets = batch['strokes'].to(device)
+            mask = batch['mask'].to(device)
+            losses = criterion(outputs, targets, mask)
+        elif model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+            images = batch['image'].to(device)
             targets = batch['strokes'].to(device)
             mask = batch['mask'].to(device)
             predictions = model(images)
             losses = criterion(predictions, targets, mask)
         else:
+            images = batch['image'].to(device)
             targets = batch['points'].to(device)
             predictions = model(images)
             losses = criterion(predictions, targets)
@@ -146,13 +195,25 @@ def validate(model, dataloader, criterion, device, epoch):
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Val]')
 
     for batch in pbar:
-        images = batch['image'].to(device)
-        if model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+        if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
+            outputs = model.forward_teacher_forcing(
+                batch['target_mask'].to(device),
+                batch['canvases'].to(device),
+                batch['cursors'].to(device),
+                batch['prev_strokes'].to(device),
+                batch['step_indices'].to(device)
+            )
+            targets = batch['strokes'].to(device)
+            mask = batch['mask'].to(device)
+            losses = criterion(outputs, targets, mask)
+        elif model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+            images = batch['image'].to(device)
             targets = batch['strokes'].to(device)
             mask = batch['mask'].to(device)
             predictions = model(images)
             losses = criterion(predictions, targets, mask)
         else:
+            images = batch['image'].to(device)
             targets = batch['points'].to(device)
             predictions = model(images)
             losses = criterion(predictions, targets)
@@ -201,14 +262,20 @@ def build_dataset(args):
             split='train',
             img_size=args.img_size,
             seq_len=args.seq_len,
-            max_items_per_category=args.max_items_per_category
+            max_items_per_category=args.max_items_per_category,
+            arch=args.arch,
+            chunk_len=args.chunk_len,
+            chunks_per_sample=args.chunks_per_sample
         )
         val_dataset = QuickDrawCleanDatasetViT(
             dataset_root=args.dataset_root,
             split='test',
             img_size=args.img_size,
             seq_len=args.seq_len,
-            max_items_per_category=args.max_items_per_category
+            max_items_per_category=args.max_items_per_category,
+            arch=args.arch,
+            chunk_len=args.chunk_len,
+            chunks_per_sample=1
         )
         return train_dataset, val_dataset
 
@@ -231,7 +298,10 @@ def build_dataset(args):
         img_size=args.img_size,
         num_points=args.num_points,
         seq_len=args.seq_len,
-        mode=args.mode
+        mode=args.mode,
+        arch=args.arch,
+        chunk_len=args.chunk_len,
+        chunks_per_sample=args.chunks_per_sample
     )
     if len(full_dataset) == 0:
         raise ValueError('No data found!')
@@ -268,7 +338,16 @@ def main():
         val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
     )
 
-    if args.mode == 'seq7':
+    if args.arch == 'autoregressive':
+        if args.mode != 'seq7':
+            raise ValueError('autoregressive currently supports --mode seq7')
+        model = ViTAutoregressiveExtractor7D(
+            img_size=args.img_size,
+            seq_len=args.seq_len,
+            embed_dim=args.embed_dim
+        ).to(device)
+        criterion = AutoregressiveTrajectoryLoss7D()
+    elif args.mode == 'seq7':
         model = ViTTrajectoryExtractor7D(
             img_size=args.img_size,
             seq_len=args.seq_len,
