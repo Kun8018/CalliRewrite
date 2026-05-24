@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Download QuickDraw SketchRNN data and arrange it for seq_extract phase 1.
+Download QuickDraw SketchRNN data and arrange local train/test files for seq_extract phase 1.
 """
 import argparse
 import os
@@ -87,15 +87,36 @@ def download_file(url, output_path, overwrite=False):
         raise
 
 
+def save_official_split_npz(output_path, stroke3_data, overwrite=False):
+    if os.path.exists(output_path) and not overwrite:
+        print(f'Skip existing: {output_path}')
+        return
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    np.savez_compressed(output_path, stroke3=stroke3_data)
+    print(f'Saved: {output_path} ({len(stroke3_data)} samples)')
+
+
+def save_official_sketchrnn_npz(raw_path, category, splits, output_dir, overwrite=False):
+    data = np.load(raw_path, allow_pickle=True, encoding='latin1')
+    for split in splits:
+        source_key = 'valid' if split == 'valid' else split
+        if source_key not in data:
+            print(f'Skip {category}/{split}: missing key {source_key} in {raw_path}')
+            continue
+        output_path = os.path.join(output_dir, split, f'{category}.npz')
+        save_official_split_npz(output_path, data[source_key], overwrite=overwrite)
+
+
 def download_from_gcs(args):
-    for split in args.splits:
-        split_dir = os.path.join(args.output_dir, split)
-        os.makedirs(split_dir, exist_ok=True)
-        for category in args.categories:
-            filename = f'{category}.npz'
-            url = f'{GCS_BASE_URL}/{split}/{urllib.parse.quote(filename)}'
-            output_path = os.path.join(split_dir, filename)
-            download_file(url, output_path, overwrite=args.overwrite)
+    raw_dir = os.path.join(args.output_dir, '_raw_sketchrnn')
+    os.makedirs(raw_dir, exist_ok=True)
+    for category in args.categories:
+        filename = f'{category}.npz'
+        url = f'{GCS_BASE_URL}/{urllib.parse.quote(filename)}'
+        raw_path = os.path.join(raw_dir, filename)
+        download_file(url, raw_path, overwrite=args.overwrite)
+        if os.path.exists(raw_path):
+            save_official_sketchrnn_npz(raw_path, category, args.splits, args.output_dir, args.overwrite)
 
 
 def download_from_googlecreativelab(args):
@@ -256,7 +277,7 @@ def main():
 
     print('\nDone.')
     print(f'Output: {args.output_dir}')
-    print('Expected by seq_extract: datasets/QuickDraw-clean/train/*.npz and test/*.npz')
+    print('Expected by seq_extract locally: datasets/QuickDraw-clean/train/*.npz and test/*.npz')
 
 
 if __name__ == '__main__':
