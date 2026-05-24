@@ -11,6 +11,7 @@ from PIL import Image
 from pathlib import Path
 
 from model import StrokeTransformer
+from visualize import visualize_strokes
 
 
 def parse_args():
@@ -150,8 +151,13 @@ def infer_single_image(model, image_path, output_dir, image_size=256, max_seq_le
     raw_path = os.path.join(output_dir, f'{base_name}_raw.npy')
     np.save(raw_path, strokes.cpu().numpy())
 
+    # 生成可视化（order/color/compare 图）
+    vis_output_dir = os.path.join(output_dir, base_name)
+    visualize_strokes(npz_path, original_img_path=image_path, output_dir=vis_output_dir)
+
     print(f'Processed {image_path}: {len(strokes_processed)} strokes')
     print(f'  -> {npz_path}')
+    print(f'  -> Visualization: {vis_output_dir}')
 
     return strokes_processed
 

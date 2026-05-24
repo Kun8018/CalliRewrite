@@ -11,6 +11,7 @@ from PIL import Image
 from pathlib import Path
 
 from model import ViTTrajectoryExtractor7D
+from visualize import visualize_strokes
 
 
 def load_model(checkpoint_path, device, img_size=224, seq_len=100, embed_dim=192):
@@ -99,7 +100,12 @@ def infer_single_image(model, image_path, output_dir, img_size=224, seq_len=100,
     npz_path = os.path.join(output_dir, f'{base_name}.npz')
     save_seq_extract_npz(npz_path, strokes_processed, img_size)
 
+    # 生成可视化（order/color/compare 图）
+    vis_output_dir = os.path.join(output_dir, base_name)
+    visualize_strokes(npz_path, original_img_path=image_path, output_dir=vis_output_dir)
+
     print(f'Processed {image_path}: {len(strokes_processed)} strokes → {npz_path}')
+    print(f'  -> Visualization: {vis_output_dir}')
     return strokes_processed
 
 

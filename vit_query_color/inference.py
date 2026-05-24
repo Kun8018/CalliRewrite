@@ -11,6 +11,7 @@ from pathlib import Path
 
 from model import ViTColorTrajectoryExtractor7D, ViTDualTrajectoryExtractor7D
 from dataset import extract_red_mask
+from visualize import visualize_strokes
 
 
 def load_model(checkpoint_path, device, mode='rgb',
@@ -159,9 +160,14 @@ def main():
             npz_path = os.path.join(args.output_dir, f'{base_name}.npz')
             save_seq_extract_npz(npz_path, strokes_processed, args.img_size)
 
+            # 生成可视化（order/color/compare 图）
+            vis_output_dir = os.path.join(args.output_dir, base_name)
+            visualize_strokes(npz_path, original_img_path=img_path, output_dir=vis_output_dir)
+
             print(f'Processed: {img_path}')
             print(f'  Strokes: {len(strokes_processed)}')
             print(f'  Output: {npz_path}')
+            print(f'  Visualization: {vis_output_dir}')
 
         except Exception as e:
             print(f'Error processing {img_path}: {e}')

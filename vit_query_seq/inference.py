@@ -13,6 +13,7 @@ from PIL import Image
 from pathlib import Path
 
 from model import ViTSeqTrajectoryExtractor7D
+from visualize import visualize_strokes
 
 
 def natural_sort_key(s):
@@ -164,9 +165,27 @@ def main():
     npz_path = os.path.join(args.output_dir, f'{base_name}.npz')
     save_seq_extract_npz(npz_path, strokes_processed, args.img_size)
 
+    # 确定原始图片路径（用于 compare 图）
+    original_img_path = None
+    if os.path.isfile(args.input):
+        original_img_path = args.input
+    else:
+        # 目录的话，取第一张图
+        image_files = []
+        for f in sorted(os.listdir(args.input), key=natural_sort_key):
+            if f.endswith(('.png', '.jpg', '.jpeg')):
+                image_files.append(os.path.join(args.input, f))
+        if image_files:
+            original_img_path = image_files[0]
+
+    # 生成可视化（order/color/compare 图）
+    vis_output_dir = os.path.join(args.output_dir, base_name)
+    visualize_strokes(npz_path, original_img_path=original_img_path, output_dir=vis_output_dir)
+
     print(f'\nProcessed: {args.input}')
     print(f'Strokes: {len(strokes_processed)}')
     print(f'Output: {npz_path}')
+    print(f'Visualization: {vis_output_dir}')
 
 
 if __name__ == '__main__':

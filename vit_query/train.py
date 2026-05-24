@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 ViT + Trajectory Queries 训练脚本
+支持 seq_extract 风格两阶段：
+phase1: QuickDraw-clean 预训练
+phase2: 书法监督数据 fine-tune（.png + .npz）
 """
 import os
 import argparse
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,7 +14,7 @@ from torch.utils.data import random_split
 from tqdm import tqdm
 
 from model import ViTTrajectoryExtractor, ViTTrajectoryExtractor7D, count_parameters
-from dataset import StrokeDatasetViT, create_dataloader
+from dataset import StrokeDatasetViT, QuickDrawCleanDatasetViT
 
 try:
     import wandb
@@ -30,36 +32,20 @@ class TrajectoryLoss2D(nn.Module):
         self.mse_loss = nn.MSELoss()
 
     def forward(self, pred_points, target_points):
-        """
-        pred_points, target_points: (B, num_points, 2)
-        """
-        # L1 损失
         l1 = self.l1_loss(pred_points, target_points)
-
-        # MSE 损失
         mse = self.mse_loss(pred_points, target_points)
-
-        # 可选：加上 DTW (Dynamic Time Warping) 损失处理点顺序问题
-        # 这里简化用 L1 + MSE
-
         total_loss = l1 + 0.1 * mse
-
-        return {
-            'total': total_loss,
-            'l1': l1,
-            'mse': mse
-        }
+        return {'total': total_loss, 'l1': l1, 'mse': mse}
 
 
 class TrajectoryLoss7D(nn.Module):
-    """7D 序列损失（和 lightweight 保持一致）"""
+    """7D 序列损失"""
 
     def __init__(self, weight_pen=1.0, weight_coord=5.0, weight_param=1.0):
         super().__init__()
         self.weight_pen = weight_pen
         self.weight_coord = weight_coord
         self.weight_param = weight_param
-
         self.bce_loss = nn.BCELoss(reduction='none')
         self.l1_loss = nn.L1Loss(reduction='none')
 
@@ -67,39 +53,34 @@ class TrajectoryLoss7D(nn.Module):
         if mask is None:
             mask = torch.ones_like(targets[..., 0])
 
-        pen_pred = predictions[..., 0]
-        pen_target = targets[..., 0]
-        pen_loss = self.bce_loss(pen_pred, pen_target)
-        pen_loss = (pen_loss * mask).sum() / mask.sum()
+        mask_sum = mask.sum().clamp_min(1.0)
+        pen_loss = self.bce_loss(predictions[..., 0], targets[..., 0])
+        pen_loss = (pen_loss * mask).sum() / mask_sum
 
-        coord_pred = predictions[..., 1:5]
-        coord_target = targets[..., 1:5]
-        coord_loss = self.l1_loss(coord_pred, coord_target)
-        coord_loss = (coord_loss.mean(dim=-1) * mask).sum() / mask.sum()
+        coord_loss = self.l1_loss(predictions[..., 1:5], targets[..., 1:5])
+        coord_loss = (coord_loss.mean(dim=-1) * mask).sum() / mask_sum
 
-        param_pred = predictions[..., 5:7]
-        param_target = targets[..., 5:7]
-        param_loss = self.l1_loss(param_pred, param_target)
-        param_loss = (param_loss.mean(dim=-1) * mask).sum() / mask.sum()
+        param_loss = self.l1_loss(predictions[..., 5:7], targets[..., 5:7])
+        param_loss = (param_loss.mean(dim=-1) * mask).sum() / mask_sum
 
         total_loss = (
             self.weight_pen * pen_loss +
             self.weight_coord * coord_loss +
             self.weight_param * param_loss
         )
-
-        return {
-            'total': total_loss,
-            'pen': pen_loss,
-            'coord': coord_loss,
-            'param': param_loss
-        }
+        return {'total': total_loss, 'pen': pen_loss, 'coord': coord_loss, 'param': param_loss}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train ViT Trajectory Extractor')
-
-    parser.add_argument('--data_dir', type=str, default=None, help='数据目录')
+    parser.add_argument('--phase', type=int, default=1, choices=[1, 2],
+                        help='1=QuickDraw-clean 预训练, 2=书法数据 fine-tune')
+    parser.add_argument('--dataset_root', type=str, default='../seq_extract/datasets',
+                        help='seq_extract 数据根目录，phase1 默认读取 QuickDraw-clean')
+    parser.add_argument('--data_dir', type=str, default=None,
+                        help='phase2 监督数据目录，要求 .png/.jpg + 同名 .npz')
+    parser.add_argument('--phase1_checkpoint', type=str, default=None,
+                        help='phase2 从 phase1 checkpoint 初始化')
     parser.add_argument('--output_dir', type=str, default='./output', help='输出目录')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=100)
@@ -109,14 +90,15 @@ def parse_args():
     parser.add_argument('--seq_len', type=int, default=100, help='7D 模式的序列长度')
     parser.add_argument('--embed_dim', type=int, default=192)
     parser.add_argument('--mode', type=str, default='seq7', choices=['seq7', 'points'],
-                        help='输出模式: seq7 (7D序列) 或 points (2D点)')
+                        help='输出模式: seq7 或 points；两阶段建议用 seq7')
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--max_items_per_category', type=int, default=None,
+                        help='phase1 调试时限制每个 QuickDraw 类别样本数')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     parser.add_argument('--use_wandb', action='store_true', help='使用 wandb')
     parser.add_argument('--wandb_project', type=str, default='vit-query-stroke')
     parser.add_argument('--save_every', type=int, default=10)
-
     return parser.parse_args()
 
 
@@ -124,8 +106,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     model.train()
     total_loss = 0.0
     loss_components = {}
-
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
+
     for batch in pbar:
         images = batch['image'].to(device)
         optimizer.zero_grad()
@@ -148,15 +130,12 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
         for k, v in losses.items():
             if k != 'total':
                 loss_components[k] = loss_components.get(k, 0.0) + v.item()
-
         pbar.set_postfix({'loss': loss.item()})
 
-    num_batches = len(dataloader)
-    avg_loss = total_loss / num_batches
+    num_batches = max(len(dataloader), 1)
     for k in loss_components:
         loss_components[k] /= num_batches
-
-    return avg_loss, loss_components
+    return total_loss / num_batches, loss_components
 
 
 @torch.no_grad()
@@ -164,11 +143,10 @@ def validate(model, dataloader, criterion, device, epoch):
     model.eval()
     total_loss = 0.0
     loss_components = {}
-
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Val]')
+
     for batch in pbar:
         images = batch['image'].to(device)
-
         if model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
             targets = batch['strokes'].to(device)
             mask = batch['mask'].to(device)
@@ -183,39 +161,56 @@ def validate(model, dataloader, criterion, device, epoch):
         for k, v in losses.items():
             if k != 'total':
                 loss_components[k] = loss_components.get(k, 0.0) + v.item()
-
         pbar.set_postfix({'loss': losses['total'].item()})
 
-    num_batches = len(dataloader)
-    avg_loss = total_loss / num_batches
+    num_batches = max(len(dataloader), 1)
     for k in loss_components:
         loss_components[k] /= num_batches
+    return total_loss / num_batches, loss_components
 
-    return avg_loss, loss_components
 
-
-def save_checkpoint(model, optimizer, epoch, loss, save_path):
+def save_checkpoint(model, optimizer, epoch, loss, save_path, args):
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
+        'phase': args.phase,
+        'args': vars(args),
     }, save_path)
     print(f'Checkpoint saved to {save_path}')
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+def load_phase1_checkpoint(model, checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state = checkpoint['model_state_dict']
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(f'Loaded phase1 checkpoint: {checkpoint_path}')
+    if missing:
+        print(f'  Missing keys: {len(missing)}')
+    if unexpected:
+        print(f'  Unexpected keys: {len(unexpected)}')
 
-    device = torch.device(args.device)
-    print(f'Using device: {device}')
 
-    if args.use_wandb and WANDB_AVAILABLE:
-        wandb.init(project=args.wandb_project, config=vars(args))
-    elif args.use_wandb and not WANDB_AVAILABLE:
-        print('Warning: wandb not installed')
-        args.use_wandb = False
+def build_dataset(args):
+    if args.phase == 1:
+        if args.mode != 'seq7':
+            raise ValueError('phase1 currently supports --mode seq7')
+        train_dataset = QuickDrawCleanDatasetViT(
+            dataset_root=args.dataset_root,
+            split='train',
+            img_size=args.img_size,
+            seq_len=args.seq_len,
+            max_items_per_category=args.max_items_per_category
+        )
+        val_dataset = QuickDrawCleanDatasetViT(
+            dataset_root=args.dataset_root,
+            split='test',
+            img_size=args.img_size,
+            seq_len=args.seq_len,
+            max_items_per_category=args.max_items_per_category
+        )
+        return train_dataset, val_dataset
 
     if args.data_dir is None:
         possible_dirs = [
@@ -225,11 +220,11 @@ def main():
         for d in possible_dirs:
             if os.path.exists(d):
                 args.data_dir = d
-                print(f'Using data dir: {d}')
+                print(f'Using phase2 data dir: {d}')
                 break
 
     if args.data_dir is None:
-        raise ValueError('No data directory found!')
+        raise ValueError('phase2 needs --data_dir with .png/.jpg + same-name .npz labels')
 
     full_dataset = StrokeDatasetViT(
         data_dir=args.data_dir,
@@ -238,14 +233,32 @@ def main():
         seq_len=args.seq_len,
         mode=args.mode
     )
-
     if len(full_dataset) == 0:
         raise ValueError('No data found!')
 
-    val_size = int(len(full_dataset) * args.val_split)
+    val_size = max(1, int(len(full_dataset) * args.val_split)) if len(full_dataset) > 1 else 0
     train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    if val_size == 0:
+        return full_dataset, full_dataset
+    return random_split(full_dataset, [train_size, val_size])
 
+
+def main():
+    args = parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    device = torch.device(args.device)
+    print(f'Using device: {device}')
+    print(f'Phase: {args.phase}')
+
+    if args.use_wandb and WANDB_AVAILABLE:
+        wandb.init(project=args.wandb_project, config=vars(args))
+    elif args.use_wandb and not WANDB_AVAILABLE:
+        print('Warning: wandb not installed')
+        args.use_wandb = False
+
+    train_dataset, val_dataset = build_dataset(args)
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        raise ValueError('No data found!')
     print(f'Train: {len(train_dataset)}, Val: {len(val_dataset)}')
 
     train_loader = torch.utils.data.DataLoader(
@@ -270,18 +283,18 @@ def main():
         ).to(device)
         criterion = TrajectoryLoss2D()
 
-    print(f'Model: {count_parameters(model)}')
+    if args.phase == 2 and args.phase1_checkpoint:
+        load_phase1_checkpoint(model, args.phase1_checkpoint, device)
 
+    print(f'Model: {count_parameters(model)}')
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
     best_val_loss = float('inf')
 
     print('Starting training...')
     for epoch in range(1, args.epochs + 1):
         train_loss, train_comp = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
         val_loss, val_comp = validate(model, val_loader, criterion, device, epoch)
-
         scheduler.step()
 
         print(f'\nEpoch {epoch}/{args.epochs}')
@@ -289,11 +302,7 @@ def main():
         print(f'  Val: {val_loss:.4f} {val_comp}')
 
         if args.use_wandb and WANDB_AVAILABLE:
-            log_dict = {
-                'epoch': epoch,
-                'train/loss': train_loss,
-                'val/loss': val_loss,
-            }
+            log_dict = {'epoch': epoch, 'train/loss': train_loss, 'val/loss': val_loss}
             for k, v in train_comp.items():
                 log_dict[f'train/{k}'] = v
             for k, v in val_comp.items():
@@ -302,23 +311,16 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_checkpoint(
-                model, optimizer, epoch, val_loss,
-                os.path.join(args.output_dir, 'model_best.pth')
-            )
-            print(f'  New best!')
+            save_checkpoint(model, optimizer, epoch, val_loss,
+                            os.path.join(args.output_dir, 'model_best.pth'), args)
+            print('  New best!')
 
         if epoch % args.save_every == 0:
-            save_checkpoint(
-                model, optimizer, epoch, val_loss,
-                os.path.join(args.output_dir, f'model_epoch_{epoch}.pth')
-            )
+            save_checkpoint(model, optimizer, epoch, val_loss,
+                            os.path.join(args.output_dir, f'model_epoch_{epoch}.pth'), args)
 
-    save_checkpoint(
-        model, optimizer, args.epochs, val_loss,
-        os.path.join(args.output_dir, 'model_final.pth')
-    )
-
+    save_checkpoint(model, optimizer, args.epochs, val_loss,
+                    os.path.join(args.output_dir, 'model_final.pth'), args)
     print(f'\nDone! Best val loss: {best_val_loss:.4f}')
 
     if args.use_wandb and WANDB_AVAILABLE:
