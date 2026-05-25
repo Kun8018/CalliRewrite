@@ -8,8 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import numpy as np
-from model import StrokeTransformer, count_parameters
-from dataset import StrokeDataset
+from model import StrokeTransformer, ResNetAutoregressiveExtractor7D, count_parameters
+from dataset import StrokeDataset, initial_seq7_state, make_autoregressive_item
 
 
 def test_model_forward():
@@ -167,8 +167,6 @@ def test_loss():
 
     criterion = StrokeLoss()
 
-    criterion = StrokeLoss()
-
     batch_size = 2
     seq_len = 50
 
@@ -198,11 +196,80 @@ def test_loss():
     print('\n✓ Loss function OK!')
 
 
+def test_autoregressive_model():
+    """测试 autoregressive 模型前向传播"""
+    print('\n' + '=' * 60)
+    print('Testing Autoregressive Model (ResNet)')
+    print('=' * 60)
+
+    model = ResNetAutoregressiveExtractor7D(
+        image_size=256,
+        max_seq_len=100,
+        d_model=256
+    )
+    print(f'\nModel created: {count_parameters(model)}')
+
+    B = 2
+    image = torch.randn(B, 1, 256, 256)
+    target_mask = 1.0 - image
+
+    print(f'\nInput target_mask shape: {target_mask.shape}')
+
+    # 测试 encode_target
+    target_tokens, target_global = model.encode_target(target_mask)
+    print(f'\nEncode target:')
+    print(f'  target_tokens shape: {target_tokens.shape}')
+    print(f'  target_global shape: {target_global.shape}')
+
+    # 测试 forward_step
+    canvas = torch.zeros(B, 1, 256, 256)
+    cursor = torch.tensor([[0.5, 0.5]], dtype=torch.float32).repeat(B, 1)
+    prev_stroke = torch.zeros(B, 7, dtype=torch.float32)
+    step = torch.tensor([[0.0]], dtype=torch.float32).repeat(B, 1)
+    hidden = None
+
+    output, hidden = model.forward_step(
+        target_tokens, target_global, canvas, cursor, prev_stroke, step, hidden
+    )
+    print(f'\nForward step (single):')
+    print(f'  seq shape: {output["seq"].shape}')
+    print(f'  pen_logits shape: {output["pen_logits"].shape}')
+    print(f'  hidden shape: {hidden.shape}')
+
+    # 测试输出范围
+    seq = output['seq']
+    pen_state = seq[..., 0]
+    coords = seq[..., 1:5]
+    params = seq[..., 5:7]
+    print(f'\nStep output ranges:')
+    print(f'  pen_state (after sigmoid): [{pen_state.min():.3f}, {pen_state.max():.3f}]')
+    print(f'  coords (after tanh): [{coords.min():.3f}, {coords.max():.3f}]')
+    print(f'  params (after sigmoid): [{params.min():.3f}, {params.max():.3f}]')
+
+    # 测试 teacher forcing
+    chunk_len = 8
+    canvases = torch.zeros(B, chunk_len, 1, 256, 256)
+    cursors = torch.zeros(B, chunk_len, 2)
+    prev_strokes = torch.zeros(B, chunk_len, 7)
+    step_indices = torch.rand(B, chunk_len, 1)
+
+    output = model.forward_teacher_forcing(target_mask, canvases, cursors, prev_strokes, step_indices)
+    print(f'\nTeacher forcing output:')
+    print(f'  seq shape: {output["seq"].shape}')
+    print(f'  pen_logits shape: {output["pen_logits"].shape}')
+
+    assert output['seq'].shape == (B, chunk_len, 7), f'Expected (B, 8, 7), got {output["seq"].shape}'
+    assert output['pen_logits'].shape == (B, chunk_len), f'Expected (B, 8), got {output["pen_logits"].shape}'
+
+    print('\n✓ Autoregressive model OK!')
+
+
 def main():
-    print('Testing Stroke Transformer...\n')
+    print('Testing Lightweight Stroke Extractor...\n')
 
     try:
         test_model_forward()
+        test_autoregressive_model()
         test_loss()
         test_dataset()
 

@@ -131,10 +131,11 @@ class StrokeTransformer(nn.Module):
         # 添加位置编码
         decoder_input = self.pos_encoder(decoder_input)
 
-        # Transformer解码
+        tgt_mask = self._causal_mask(decoder_input.shape[1], decoder_input.device)
         output = self.decoder(
             tgt=decoder_input,
-            memory=memory
+            memory=memory,
+            tgt_mask=tgt_mask
         )  # (batch, seq_len, d_model)
 
         # 输出预测
@@ -150,6 +151,9 @@ class StrokeTransformer(nn.Module):
         ], dim=-1)
 
         return predictions
+
+    def _causal_mask(self, seq_len, device):
+        return torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
 
     @torch.no_grad()
     def generate(self, image, max_len=100):
@@ -174,13 +178,12 @@ class StrokeTransformer(nn.Module):
         current_input = self.sos_embedding.repeat(batch_size, 1, 1)  # (batch, 1, d_model)
 
         for _ in range(max_len):
-            # 添加位置编码
             decoder_input = self.pos_encoder(current_input)
-
-            # 解码
+            tgt_mask = self._causal_mask(decoder_input.shape[1], decoder_input.device)
             output = self.decoder(
                 tgt=decoder_input,
-                memory=memory
+                memory=memory,
+                tgt_mask=tgt_mask
             )
 
             # 预测最后一步
@@ -214,6 +217,128 @@ class StrokeTransformer(nn.Module):
         strokes = torch.stack(generated, dim=1)  # (batch, seq_len, 7)
 
         return strokes[0]
+
+
+class ResNetFeatureBackbone(nn.Module):
+    def __init__(self, image_size=256, d_model=256):
+        super().__init__()
+        resnet = resnet18(weights=None)
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.conv1.weight.data = resnet.conv1.weight.data.mean(dim=1, keepdim=True)
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+        self.layer1 = resnet.layer1
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+        self.proj = nn.Conv2d(512, d_model, kernel_size=1)
+        num_tokens = (image_size // 32) ** 2
+        self.pos_embed = nn.Parameter(torch.randn(1, num_tokens, d_model) * 0.02)
+
+    def forward_features(self, image):
+        x = self.conv1(image)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.proj(x)
+        tokens = x.flatten(2).transpose(1, 2)
+        return tokens + self.pos_embed[:, :tokens.shape[1]]
+
+
+class ResNetAutoregressiveExtractor7D(nn.Module):
+    def __init__(self, image_size=256, max_seq_len=100, d_model=256, hidden_dim=256):
+        super().__init__()
+        self.image_size = image_size
+        self.max_seq_len = max_seq_len
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+
+        self.target_backbone = ResNetFeatureBackbone(image_size=image_size, d_model=d_model)
+        self.target_pool = nn.LayerNorm(d_model)
+        self.canvas_encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=5, stride=2, padding=2),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(64, d_model, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.LayerNorm(d_model),
+        )
+        self.cursor_mlp = nn.Sequential(nn.Linear(2, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.prev_stroke_mlp = nn.Sequential(nn.Linear(7, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.step_mlp = nn.Sequential(nn.Linear(1, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        self.state_query_norm = nn.LayerNorm(d_model)
+        self.target_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        self.gru_input = nn.Sequential(
+            nn.Linear(d_model * 5, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.pen_head = nn.Linear(hidden_dim, 1)
+        self.coord_head = nn.Linear(hidden_dim, 4)
+        self.param_head = nn.Linear(hidden_dim, 2)
+
+    def encode_target(self, target_mask):
+        tokens = self.target_backbone.forward_features(target_mask)
+        global_feat = self.target_pool(tokens.mean(dim=1))
+        return tokens, global_feat
+
+    def encode_step(self, target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden=None):
+        canvas_feat = self.canvas_encoder(canvas)
+        cursor_feat = self.cursor_mlp(cursor)
+        prev_feat = self.prev_stroke_mlp(prev_stroke)
+        step_feat = self.step_mlp(step_index)
+        query = self.state_query_norm(canvas_feat + cursor_feat + prev_feat + step_feat).unsqueeze(1)
+        attn_feat, _ = self.target_attn(query, target_tokens, target_tokens)
+        attn_feat = attn_feat.squeeze(1)
+        gru_input = self.gru_input(torch.cat([
+            attn_feat, target_global, canvas_feat, cursor_feat, prev_feat
+        ], dim=-1))
+        if hidden is None:
+            hidden = torch.zeros(canvas.shape[0], self.hidden_dim, device=canvas.device, dtype=canvas.dtype)
+        return self.gru(gru_input, hidden)
+
+    def decode_hidden(self, hidden):
+        pen_logits = self.pen_head(hidden).squeeze(-1)
+        coords = torch.tanh(self.coord_head(hidden))
+        params = torch.sigmoid(self.param_head(hidden))
+        seq = torch.cat([torch.sigmoid(pen_logits).unsqueeze(-1), coords, params], dim=-1)
+        return {'seq': seq, 'pen_logits': pen_logits}
+
+    def forward_step(self, target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden=None):
+        hidden = self.encode_step(target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden)
+        output = self.decode_hidden(hidden)
+        return output, hidden
+
+    def forward_teacher_forcing(self, target_mask, canvases, cursors, prev_strokes, step_indices):
+        target_tokens, target_global = self.encode_target(target_mask)
+        hidden = None
+        seq_outputs = []
+        pen_logits_outputs = []
+        for i in range(canvases.shape[1]):
+            output, hidden = self.forward_step(
+                target_tokens,
+                target_global,
+                canvases[:, i],
+                cursors[:, i],
+                prev_strokes[:, i],
+                step_indices[:, i],
+                hidden
+            )
+            seq_outputs.append(output['seq'])
+            pen_logits_outputs.append(output['pen_logits'])
+        return {
+            'seq': torch.stack(seq_outputs, dim=1),
+            'pen_logits': torch.stack(pen_logits_outputs, dim=1),
+        }
 
 
 class PositionalEncoding(nn.Module):

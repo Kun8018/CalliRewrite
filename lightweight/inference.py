@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-推理脚本：使用训练好的模型生成笔画序列
-输出与 seq_extract 兼容的 npz 文件，可直接用于二阶段
+轻量模型推理脚本，输出 seq_extract 兼容 npz。
 """
 import os
 import argparse
@@ -10,163 +9,230 @@ import torch
 from PIL import Image
 from pathlib import Path
 
-from model import StrokeTransformer
+from model import StrokeTransformer, ResNetAutoregressiveExtractor7D
+from dataset import initial_seq7_state, apply_seq7_step, find_undrawn_cursor
 from visualize import visualize_strokes
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Stroke Transformer Inference')
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='模型检查点路径')
-    parser.add_argument('--input', type=str, required=True,
-                        help='输入图像路径或目录')
-    parser.add_argument('--output_dir', type=str, default='./inference_output',
-                        help='输出目录')
-    parser.add_argument('--image_size', type=int, default=256)
-    parser.add_argument('--max_seq_len', type=int, default=100)
-    parser.add_argument('--d_model', type=int, default=256)
-    parser.add_argument('--nhead', type=int, default=4)
-    parser.add_argument('--num_decoder_layers', type=int, default=3)
+    parser = argparse.ArgumentParser(description='Lightweight Stroke Inference')
+    parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--input', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='./inference_output')
+    parser.add_argument('--arch', type=str, default=None, choices=['autoregressive', 'oneshot'])
+    parser.add_argument('--image_size', type=int, default=None)
+    parser.add_argument('--max_seq_len', type=int, default=None)
+    parser.add_argument('--d_model', type=int, default=None)
+    parser.add_argument('--nhead', type=int, default=None)
+    parser.add_argument('--num_decoder_layers', type=int, default=None)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--pen_threshold', type=float, default=0.5,
-                        help='pen_state 二值化阈值')
+    parser.add_argument('--pen_threshold', type=float, default=0.5)
+    parser.add_argument('--max_consecutive_lifts', type=int, default=3)
+    parser.add_argument('--max_rounds', type=int, default=4)
     return parser.parse_args()
 
 
-def load_model(checkpoint_path, device, d_model=256, nhead=4, num_decoder_layers=3, max_seq_len=100):
-    """加载训练好的模型"""
-    model = StrokeTransformer(
-        d_model=d_model,
-        nhead=nhead,
-        num_decoder_layers=num_decoder_layers,
-        max_seq_len=max_seq_len
-    ).to(device)
+def checkpoint_arg(checkpoint_args, cli_value, name, default):
+    if cli_value is not None:
+        return cli_value
+    return checkpoint_args.get(name, default)
 
+
+def load_model(checkpoint_path, device, arch=None, image_size=None, max_seq_len=None,
+               d_model=None, nhead=None, num_decoder_layers=None):
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint_args = checkpoint.get('args', {})
+    arch = arch or checkpoint.get('arch') or checkpoint_args.get('arch', 'oneshot')
+    image_size = checkpoint_arg(checkpoint_args, image_size, 'image_size', 256)
+    max_seq_len = checkpoint_arg(checkpoint_args, max_seq_len, 'max_seq_len', 100)
+    d_model = checkpoint_arg(checkpoint_args, d_model, 'd_model', 256)
+    nhead = checkpoint_arg(checkpoint_args, nhead, 'nhead', 4)
+    num_decoder_layers = checkpoint_arg(checkpoint_args, num_decoder_layers, 'num_decoder_layers', 3)
+
+    if arch == 'autoregressive':
+        model = ResNetAutoregressiveExtractor7D(
+            image_size=image_size,
+            max_seq_len=max_seq_len,
+            d_model=d_model
+        ).to(device)
+    else:
+        model = StrokeTransformer(
+            d_model=d_model,
+            nhead=nhead,
+            num_decoder_layers=num_decoder_layers,
+            max_seq_len=max_seq_len
+        ).to(device)
+
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
+    print(f'Model loaded from {checkpoint_path} (epoch {checkpoint["epoch"]}, arch {arch})')
+    return model, arch, image_size, max_seq_len
 
-    print(f'Model loaded from {checkpoint_path} (epoch {checkpoint["epoch"]})')
-    return model
 
-
-def preprocess_image(image_path, image_size=256):
-    """预处理输入图像"""
-    img = Image.open(image_path).convert('L')  # 灰度图
+def preprocess_image(image_path, image_size=256, normalize='zero_one'):
+    img = Image.open(image_path).convert('L')
     if img.size != (image_size, image_size):
         img = img.resize((image_size, image_size))
-
-    # 归一化到 [-1, 1]
     img_np = np.array(img, dtype=np.float32) / 255.0
-    img_np = (img_np - 0.5) / 0.5
-
-    # 转换为 tensor: (1, 1, H, W)
-    img_tensor = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0)
-    return img_tensor
+    if normalize == 'minus_one_one':
+        img_np = (img_np - 0.5) / 0.5
+    return torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0)
 
 
-def postprocess_strokes(strokes, pen_threshold=0.5):
-    """
-    后处理生成的笔画序列
-    strokes: (seq_len, 7) - [pen_state, x1, y1, x2, y2, r, s]
-    """
+def preprocess_target_mask(image_path, image_size=256):
+    return 1.0 - preprocess_image(image_path, image_size, normalize='zero_one')
+
+
+def postprocess_strokes(strokes, pen_threshold=0.5, max_consecutive_lifts=3):
     strokes_np = strokes.cpu().numpy()
-
-    # 二值化 pen_state
     strokes_np[:, 0] = (strokes_np[:, 0] > pen_threshold).astype(np.float32)
 
-    # 移除连续的移动指令，提前终止
-    # 找到有效的笔画长度
-    valid_len = len(strokes_np)
+    if max_consecutive_lifts > 0:
+        valid_len = len(strokes_np)
+        lift_count = 0
+        for i in range(len(strokes_np)):
+            if strokes_np[i, 0] == 1:
+                lift_count += 1
+                if lift_count >= max_consecutive_lifts:
+                    valid_len = i + 1
+                    break
+            else:
+                lift_count = 0
+        strokes_np = strokes_np[:valid_len]
 
-    # 简单策略：如果出现连续多个 pen_state=1 就截断
-    move_count = 0
-    for i in range(len(strokes_np)):
-        if strokes_np[i, 0] == 1:
-            move_count += 1
-            if move_count >= 3:
-                valid_len = i + 1
-                break
-        else:
-            move_count = 0
-
-    strokes_np = strokes_np[:valid_len]
-
-    # 确保至少有一个笔画
     if len(strokes_np) == 0:
         strokes_np = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
-
     return strokes_np
 
 
-def save_seq_extract_npz(output_path, strokes_data, image_size=256):
-    """
-    保存为与 seq_extract 兼容的 npz 格式
-    包含二阶段需要的所有字段
-    """
-    # 构造完整数据
-    # 注意：这里的 init_cursors, round_length, init_width 是简化版本
-    # 实际 seq_extract 输出的这些字段更复杂，但二阶段主要使用 strokes_data
-
-    # 简单的初始光标位置
-    init_cursors = np.array([[0.5, 0.5]], dtype=np.float32)
-
-    # 每轮步数（简化为整个序列长度）
-    round_length = np.array([len(strokes_data)], dtype=np.int32)
-
-    # 初始宽度（从第一个笔画获取）
-    init_width = float(strokes_data[0, 5]) if len(strokes_data) > 0 else 0.1
+def save_seq_extract_npz(output_path, strokes_data, image_size=256, init_cursors=None, round_lengths=None):
+    if init_cursors is None:
+        init_cursors = [[0.5, 0.5]]
+    if round_lengths is None:
+        round_lengths = [len(strokes_data)]
+    init_width = np.array(float(strokes_data[0, 5]) if len(strokes_data) > 0 else 0.1, dtype=np.float64)
 
     np.savez_compressed(
         output_path,
-        strokes_data=strokes_data.astype(np.float32),
-        init_cursors=init_cursors,
-        image_size=image_size,
-        round_length=round_length,
+        strokes_data=strokes_data.astype(np.float64),
+        init_cursors=np.asarray(init_cursors, dtype=np.float32),
+        image_size=np.array(image_size, dtype=np.int64),
+        round_length=np.asarray(round_lengths, dtype=np.int64),
         init_width=init_width
     )
 
 
-def infer_single_image(model, image_path, output_dir, image_size=256, max_seq_len=100, pen_threshold=0.5, device='cuda'):
-    """推理单张图像"""
-    # 预处理
-    img_tensor = preprocess_image(image_path, image_size).to(device)
-
-    # 推理
-    with torch.no_grad():
-        strokes = model.generate(img_tensor, max_len=max_seq_len)
-
-    # 后处理
-    strokes_processed = postprocess_strokes(strokes, pen_threshold)
-
-    # 准备输出
+def save_inference_outputs(image_path, output_dir, strokes_data, image_size, init_cursors=None, round_lengths=None):
     os.makedirs(output_dir, exist_ok=True)
     base_name = Path(image_path).stem
-
-    # 保存 npz（兼容 seq_extract 格式）
     npz_path = os.path.join(output_dir, f'{base_name}.npz')
-    save_seq_extract_npz(npz_path, strokes_processed, image_size)
+    save_seq_extract_npz(npz_path, strokes_data, image_size, init_cursors, round_lengths)
 
-    # 同时保存原始笔画数据（用于调试）
-    raw_path = os.path.join(output_dir, f'{base_name}_raw.npy')
-    np.save(raw_path, strokes.cpu().numpy())
-
-    # 生成可视化（order/color/compare 图）
     vis_output_dir = os.path.join(output_dir, base_name)
     visualize_strokes(npz_path, original_img_path=image_path, output_dir=vis_output_dir)
 
-    print(f'Processed {image_path}: {len(strokes_processed)} strokes')
+    print(f'Processed {image_path}: {len(strokes_data)} strokes')
     print(f'  -> {npz_path}')
     print(f'  -> Visualization: {vis_output_dir}')
+    return strokes_data
 
-    return strokes_processed
+
+def infer_single_image_oneshot(model, image_path, output_dir, image_size=256, max_seq_len=100,
+                               pen_threshold=0.5, max_consecutive_lifts=3, device='cuda'):
+    img_tensor = preprocess_image(image_path, image_size, normalize='minus_one_one').to(device)
+    with torch.no_grad():
+        strokes = model.generate(img_tensor, max_len=max_seq_len)
+    strokes_processed = postprocess_strokes(strokes, pen_threshold, max_consecutive_lifts)
+    return save_inference_outputs(image_path, output_dir, strokes_processed, image_size)
 
 
-def infer_directory(model, input_dir, output_dir, image_size=256, max_seq_len=100, pen_threshold=0.5, device='cuda'):
-    """推理整个目录"""
+def infer_single_image_autoregressive(model, image_path, output_dir, image_size=256, max_seq_len=100,
+                                      pen_threshold=0.5, max_consecutive_lifts=3,
+                                      max_rounds=4, device='cuda'):
+    target_mask = preprocess_target_mask(image_path, image_size).to(device)
+    state = initial_seq7_state(image_size)
+    init_cursors = [state['cursor'].copy()]
+    round_lengths = []
+    current_round_len = 0
+    consecutive_lifts = 0
+    hidden = None
+    prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device)
+    strokes_out = []
+
+    with torch.no_grad():
+        target_tokens, target_global = model.encode_target(target_mask)
+        for step_idx in range(max_seq_len):
+            canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+            cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
+            step = torch.tensor([[step_idx / max(max_seq_len, 1)]], dtype=torch.float32, device=device)
+            output, hidden = model.forward_step(
+                target_tokens, target_global, canvas, cursor, prev_stroke, step, hidden
+            )
+            stroke = output['seq'][0].detach().cpu().numpy().astype(np.float32)
+            stroke[0] = 1.0 if stroke[0] > pen_threshold else 0.0
+            strokes_out.append(stroke.copy())
+            current_round_len += 1
+
+            state = apply_seq7_step(state, stroke, image_size)
+            prev_stroke = torch.tensor(stroke, dtype=torch.float32, device=device).unsqueeze(0)
+
+            if stroke[0] == 1.0:
+                consecutive_lifts += 1
+            else:
+                consecutive_lifts = 0
+
+            if max_consecutive_lifts > 0 and consecutive_lifts >= max_consecutive_lifts:
+                round_lengths.append(current_round_len)
+                if len(round_lengths) >= max_rounds:
+                    break
+                target_np = target_mask[0, 0].detach().cpu().numpy()
+                next_cursor = find_undrawn_cursor(target_np, state['canvas'])
+                if next_cursor is None:
+                    break
+                state['cursor'] = next_cursor
+                state['prev_stroke'] = np.zeros(7, dtype=np.float32)
+                prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device)
+                hidden = None
+                init_cursors.append(next_cursor.copy())
+                current_round_len = 0
+                consecutive_lifts = 0
+
+    if current_round_len > 0 and (not round_lengths or sum(round_lengths) < len(strokes_out)):
+        round_lengths.append(current_round_len)
+    if not strokes_out:
+        strokes_out = [np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0], dtype=np.float32)]
+        round_lengths = [1]
+
+    strokes_processed = np.asarray(strokes_out, dtype=np.float32)
+    return save_inference_outputs(image_path, output_dir, strokes_processed, image_size, init_cursors, round_lengths)
+
+
+def infer_single_image(model, image_path, output_dir, arch='autoregressive', image_size=256, max_seq_len=100,
+                       pen_threshold=0.5, max_consecutive_lifts=3, max_rounds=4, device='cuda'):
+    if arch == 'autoregressive':
+        return infer_single_image_autoregressive(
+            model, image_path, output_dir,
+            image_size=image_size,
+            max_seq_len=max_seq_len,
+            pen_threshold=pen_threshold,
+            max_consecutive_lifts=max_consecutive_lifts,
+            max_rounds=max_rounds,
+            device=device
+        )
+    return infer_single_image_oneshot(
+        model, image_path, output_dir,
+        image_size=image_size,
+        max_seq_len=max_seq_len,
+        pen_threshold=pen_threshold,
+        max_consecutive_lifts=max_consecutive_lifts,
+        device=device
+    )
+
+
+def infer_directory(model, input_dir, output_dir, arch='autoregressive', image_size=256, max_seq_len=100,
+                    pen_threshold=0.5, max_consecutive_lifts=3, max_rounds=4, device='cuda'):
     image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
     image_paths = []
-
     for ext in image_extensions:
         image_paths.extend(Path(input_dir).glob(f'*{ext}'))
         image_paths.extend(Path(input_dir).glob(f'*{ext.upper()}'))
@@ -179,50 +245,57 @@ def infer_directory(model, input_dir, output_dir, image_size=256, max_seq_len=10
         try:
             strokes = infer_single_image(
                 model, str(img_path), output_dir,
+                arch=arch,
                 image_size=image_size,
                 max_seq_len=max_seq_len,
                 pen_threshold=pen_threshold,
+                max_consecutive_lifts=max_consecutive_lifts,
+                max_rounds=max_rounds,
                 device=device
             )
             all_strokes.append((str(img_path), strokes))
         except Exception as e:
             print(f'Error processing {img_path}: {e}')
-
     return all_strokes
 
 
 def main():
     args = parse_args()
-
     device = torch.device(args.device)
     print(f'Using device: {device}')
-
-    # 加载模型
-    model = load_model(
-        args.checkpoint, device,
+    model, arch, image_size, max_seq_len = load_model(
+        args.checkpoint,
+        device,
+        arch=args.arch,
+        image_size=args.image_size,
+        max_seq_len=args.max_seq_len,
         d_model=args.d_model,
         nhead=args.nhead,
-        num_decoder_layers=args.num_decoder_layers,
-        max_seq_len=args.max_seq_len
+        num_decoder_layers=args.num_decoder_layers
     )
 
-    # 推理
     if os.path.isfile(args.input):
         print(f'Processing single image: {args.input}')
         infer_single_image(
             model, args.input, args.output_dir,
-            image_size=args.image_size,
-            max_seq_len=args.max_seq_len,
+            arch=arch,
+            image_size=image_size,
+            max_seq_len=max_seq_len,
             pen_threshold=args.pen_threshold,
+            max_consecutive_lifts=args.max_consecutive_lifts,
+            max_rounds=args.max_rounds,
             device=device
         )
     elif os.path.isdir(args.input):
         print(f'Processing directory: {args.input}')
         infer_directory(
             model, args.input, args.output_dir,
-            image_size=args.image_size,
-            max_seq_len=args.max_seq_len,
+            arch=arch,
+            image_size=image_size,
+            max_seq_len=max_seq_len,
             pen_threshold=args.pen_threshold,
+            max_consecutive_lifts=args.max_consecutive_lifts,
+            max_rounds=args.max_rounds,
             device=device
         )
     else:
