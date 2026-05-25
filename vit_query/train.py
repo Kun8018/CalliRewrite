@@ -133,7 +133,8 @@ def parse_args():
     parser.add_argument('--max_items_per_category', type=int, default=None,
                         help='phase1 调试时限制每个 QuickDraw 类别样本数')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    parser.add_argument('--use_wandb', action='store_true', help='使用 wandb')
+    parser.add_argument('--no-wandb', action='store_false', dest='use_wandb', help='Disable wandb logging')
+    parser.set_defaults(use_wandb=True)
     parser.add_argument('--wandb_project', type=str, default='vit-query-stroke')
     parser.add_argument('--save_every', type=int, default=10)
     return parser.parse_args()
