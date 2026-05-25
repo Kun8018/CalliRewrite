@@ -161,10 +161,12 @@ def make_seq7_item(image, strokes, seq_len):
     }
 
 
-def initial_seq7_state(img_size):
+def initial_seq7_state(img_size, cursor=None):
+    if cursor is None:
+        cursor = np.array([0.5, 0.5], dtype=np.float32)
     return {
         'canvas': np.zeros((img_size, img_size), dtype=np.float32),
-        'cursor': np.array([0.5, 0.5], dtype=np.float32),
+        'cursor': np.asarray(cursor, dtype=np.float32),
         'prev_stroke': np.zeros(7, dtype=np.float32),
         'prev_width': 0.1,
         'prev_scaling': 1.0,
@@ -328,30 +330,47 @@ def render_stroke3_tensor(stroke3, img_size):
     return torch.tensor(arr).unsqueeze(0)
 
 
+def normalized_points_to_seq7(points, pen_lifts, img_size=224):
+    if len(points) < 2:
+        return np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
+
+    state = initial_seq7_state(img_size, cursor=points[0])
+    result = []
+    for i in range(1, len(points)):
+        curr_window_size = seq7_window_size(state, img_size)
+        prev = points[i - 1]
+        point = points[i]
+        pen = 1.0 if pen_lifts[i - 1] > 0.5 else 0.0
+        if pen == 1.0:
+            stroke = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0], dtype=np.float32)
+        else:
+            cursor = state['cursor']
+            ctrl = (prev + point) / 2.0
+            scale = 2.0 * img_size / max(curr_window_size, 1e-6)
+            ctrl_rel = (ctrl - cursor) * scale
+            end_rel = (point - cursor) * scale
+            stroke = np.array([
+                0.0,
+                np.clip(ctrl_rel[0], -1.0, 1.0),
+                np.clip(ctrl_rel[1], -1.0, 1.0),
+                np.clip(end_rel[0], -1.0, 1.0),
+                np.clip(end_rel[1], -1.0, 1.0),
+                0.1,
+                1.0
+            ], dtype=np.float32)
+        result.append(stroke)
+        state = apply_seq7_step(state, stroke, img_size)
+        if pen == 1.0:
+            state['cursor'] = point.astype(np.float32)
+
+    return np.asarray(result, dtype=np.float32)
+
+
 def quickdraw_stroke3_to_7d(stroke3):
     if len(stroke3) < 2:
         return np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
-
     xy = normalize_xy(stroke3)
-    result = []
-    current = xy[0]
-
-    for i in range(1, len(xy)):
-        prev = xy[i - 1]
-        point = xy[i]
-        if stroke3[i - 1, 2] > 0.5:
-            result.append([1.0, 0.0, 0.0, point[0] - current[0], point[1] - current[1], 0.1, 1.0])
-            current = point
-            continue
-
-        delta = point - current
-        ctrl = (prev + point) / 2 - current
-        result.append([0.0, ctrl[0], ctrl[1], delta[0], delta[1], 0.1, 1.0])
-        current = point
-
-    if not result:
-        result.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0])
-    return np.asarray(result, dtype=np.float32)
+    return normalized_points_to_seq7(xy, stroke3[:, 2], img_size=224)
 
 
 def create_dataloader(data_dir=None, npz_files=None, batch_size=32,
