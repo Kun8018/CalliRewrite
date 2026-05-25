@@ -317,8 +317,17 @@ def normalize_xy(points):
     return (xy - min_xy) / scale
 
 
+def stroke3_to_normalized_xy(stroke3):
+    stroke3 = np.asarray(stroke3, dtype=np.float32)
+    xy = np.cumsum(stroke3[:, :2], axis=0)
+    min_xy = xy.min(axis=0)
+    max_xy = xy.max(axis=0)
+    scale = np.maximum(max_xy - min_xy, 1e-6)
+    return (xy - min_xy) / scale
+
+
 def render_stroke3_tensor(stroke3, img_size):
-    xy = normalize_xy(stroke3)
+    xy = stroke3_to_normalized_xy(stroke3)
     pts = xy * (img_size - 1)
     img = Image.new('L', (img_size, img_size), 255)
     draw = ImageDraw.Draw(img)
@@ -369,7 +378,7 @@ def normalized_points_to_seq7(points, pen_lifts, img_size=224):
 def quickdraw_stroke3_to_7d(stroke3):
     if len(stroke3) < 2:
         return np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
-    xy = normalize_xy(stroke3)
+    xy = stroke3_to_normalized_xy(stroke3)
     return normalized_points_to_seq7(xy, stroke3[:, 2], img_size=224)
 
 
