@@ -3,6 +3,7 @@
 ResNet-18 lightweight stroke extraction training.
 """
 import os
+import csv
 import argparse
 import torch
 import torch.nn as nn
@@ -15,6 +16,12 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
 
 from model import StrokeTransformer, ResNetAutoregressiveExtractor7D, count_parameters
 from dataset import StrokeDataset, QuickDrawCleanDataset, QuickDrawConverter
@@ -111,8 +118,8 @@ def parse_args():
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    parser.add_argument('--no-wandb', action='store_false', dest='use_wandb', help='Disable wandb logging')
-    parser.set_defaults(use_wandb=True)
+    parser.add_argument('--use-wandb', action='store_true', help='Enable wandb logging')
+    parser.add_argument('--use-tensorboard', action='store_true', help='Enable TensorBoard logging')
     parser.add_argument('--wandb_project', type=str, default='lightweight-stroke')
     parser.add_argument('--save_every', type=int, default=10)
     return parser.parse_args()
@@ -292,6 +299,26 @@ def main():
     print(f'Using device: {device}')
     print(f'Arch: {args.arch}, Phase: {args.phase}')
 
+    # CSV logger
+    csv_path = os.path.join(args.output_dir, 'train_log.csv')
+    csv_file = open(csv_path, 'w', buffering=1)  # line-buffered
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow([
+        'epoch',
+        'train_loss', 'train_pen', 'train_coord', 'train_param',
+        'val_loss', 'val_pen', 'val_coord', 'val_param',
+        'best_val_loss'
+    ])
+    print(f'Training log saved to: {csv_path}')
+
+    # TensorBoard
+    writer = None
+    if args.use_tensorboard and TENSORBOARD_AVAILABLE:
+        tb_dir = os.path.join(args.output_dir, 'tensorboard')
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+        print(f'TensorBoard logs saved to: {tb_dir}')
+
     if args.use_wandb and WANDB_AVAILABLE:
         wandb.init(project=args.wandb_project, config=vars(args))
     elif args.use_wandb and not WANDB_AVAILABLE:
@@ -330,7 +357,28 @@ def main():
         print(f'  Train Loss: {train_loss:.4f} (pen={train_comp["pen"]:.4f}, coord={train_comp["coord"]:.4f}, param={train_comp["param"]:.4f})')
         print(f'  Val Loss: {val_loss:.4f} (pen={val_comp["pen"]:.4f}, coord={val_comp["coord"]:.4f}, param={val_comp["param"]:.4f})')
 
-        if args.use_wandb:
+        # CSV logging
+        csv_writer.writerow([
+            epoch,
+            train_loss, train_comp['pen'], train_comp['coord'], train_comp['param'],
+            val_loss, val_comp['pen'], val_comp['coord'], val_comp['param'],
+            best_val_loss
+        ])
+
+        # TensorBoard logging
+        if writer:
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Loss/train_pen', train_comp['pen'], epoch)
+            writer.add_scalar('Loss/train_coord', train_comp['coord'], epoch)
+            writer.add_scalar('Loss/train_param', train_comp['param'], epoch)
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('Loss/val_pen', val_comp['pen'], epoch)
+            writer.add_scalar('Loss/val_coord', val_comp['coord'], epoch)
+            writer.add_scalar('Loss/val_param', val_comp['param'], epoch)
+            writer.flush()
+
+        # WandB logging
+        if args.use_wandb and WANDB_AVAILABLE:
             wandb.log({
                 'epoch': epoch,
                 'train/loss': train_loss,
@@ -355,7 +403,11 @@ def main():
     print('\nTraining complete!')
     print(f'Best val loss: {best_val_loss:.4f}')
 
-    if args.use_wandb:
+    csv_file.close()
+    if writer:
+        writer.close()
+
+    if args.use_wandb and WANDB_AVAILABLE:
         wandb.finish()
 
 

@@ -6,6 +6,7 @@ phase1: QuickDraw-clean 预训练
 phase2: 书法监督数据 fine-tune（.png + .npz）
 """
 import os
+import csv
 import argparse
 import torch
 import torch.nn as nn
@@ -21,6 +22,12 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    TENSORBOARD_AVAILABLE = False
 
 
 class TrajectoryLoss2D(nn.Module):
@@ -133,8 +140,8 @@ def parse_args():
     parser.add_argument('--max_items_per_category', type=int, default=None,
                         help='phase1 调试时限制每个 QuickDraw 类别样本数')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    parser.add_argument('--no-wandb', action='store_false', dest='use_wandb', help='Disable wandb logging')
-    parser.set_defaults(use_wandb=True)
+    parser.add_argument('--use-wandb', action='store_true', help='Enable wandb logging')
+    parser.add_argument('--use-tensorboard', action='store_true', help='Enable TensorBoard logging')
     parser.add_argument('--wandb_project', type=str, default='vit-query-stroke')
     parser.add_argument('--save_every', type=int, default=10)
     return parser.parse_args()
@@ -321,6 +328,28 @@ def main():
     print(f'Using device: {device}')
     print(f'Phase: {args.phase}')
 
+    # CSV logger
+    csv_path = os.path.join(args.output_dir, 'train_log.csv')
+    csv_file = open(csv_path, 'w', buffering=1)  # line-buffered
+    csv_writer = csv.writer(csv_file)
+    # Write header based on mode/arch
+    header = ['epoch', 'train_loss', 'val_loss', 'best_val_loss']
+    # Add loss components
+    if args.mode == 'seq7' or args.arch == 'autoregressive':
+        header.extend(['train_pen', 'train_coord', 'train_param', 'val_pen', 'val_coord', 'val_param'])
+    else:
+        header.extend(['train_l1', 'train_mse', 'val_l1', 'val_mse'])
+    csv_writer.writerow(header)
+    print(f'Training log saved to: {csv_path}')
+
+    # TensorBoard
+    writer = None
+    if args.use_tensorboard and TENSORBOARD_AVAILABLE:
+        tb_dir = os.path.join(args.output_dir, 'tensorboard')
+        os.makedirs(tb_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_dir)
+        print(f'TensorBoard logs saved to: {tb_dir}')
+
     if args.use_wandb and WANDB_AVAILABLE:
         wandb.init(project=args.wandb_project, config=vars(args))
     elif args.use_wandb and not WANDB_AVAILABLE:
@@ -381,6 +410,30 @@ def main():
         print(f'  Train: {train_loss:.4f} {train_comp}')
         print(f'  Val: {val_loss:.4f} {val_comp}')
 
+        # CSV logging
+        csv_row = [epoch, train_loss, val_loss, best_val_loss]
+        if args.mode == 'seq7' or args.arch == 'autoregressive':
+            csv_row.extend([
+                train_comp.get('pen', 0.0), train_comp.get('coord', 0.0), train_comp.get('param', 0.0),
+                val_comp.get('pen', 0.0), val_comp.get('coord', 0.0), val_comp.get('param', 0.0)
+            ])
+        else:
+            csv_row.extend([
+                train_comp.get('l1', 0.0), train_comp.get('mse', 0.0),
+                val_comp.get('l1', 0.0), val_comp.get('mse', 0.0)
+            ])
+        csv_writer.writerow(csv_row)
+
+        # TensorBoard logging
+        if writer:
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            for k, v in train_comp.items():
+                writer.add_scalar(f'Loss/train_{k}', v, epoch)
+            for k, v in val_comp.items():
+                writer.add_scalar(f'Loss/val_{k}', v, epoch)
+            writer.flush()
+
         if args.use_wandb and WANDB_AVAILABLE:
             log_dict = {'epoch': epoch, 'train/loss': train_loss, 'val/loss': val_loss}
             for k, v in train_comp.items():
@@ -402,6 +455,10 @@ def main():
     save_checkpoint(model, optimizer, args.epochs, val_loss,
                     os.path.join(args.output_dir, 'model_final.pth'), args)
     print(f'\nDone! Best val loss: {best_val_loss:.4f}')
+
+    csv_file.close()
+    if writer:
+        writer.close()
 
     if args.use_wandb and WANDB_AVAILABLE:
         wandb.finish()
