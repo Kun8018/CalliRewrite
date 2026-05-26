@@ -300,11 +300,17 @@ class Tee:
         self.log = open(file_path, 'w', buffering=1)
 
     def write(self, message):
-        self.terminal.write(message)
+        try:
+            self.terminal.write(message)
+        except OSError:
+            pass  # SSH 断开时忽略 terminal 错误
         self.log.write(message)
 
     def flush(self):
-        self.terminal.flush()
+        try:
+            self.terminal.flush()
+        except OSError:
+            pass  # SSH 断开时忽略 terminal 错误
         self.log.flush()
 
     def close(self):
