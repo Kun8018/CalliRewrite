@@ -1,6 +1,9 @@
 #!/bin/bash
 # Lightweight (ResNet) Phase 1 Training (QuickDraw)
 
+# Activate conda environment
+conda activate /data1/Calliwrite/kun/CalliRewrite/calli_train_env
+
 cd "$(dirname "$0")"
 
 # Download data first if not present
