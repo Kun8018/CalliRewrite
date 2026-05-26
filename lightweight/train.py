@@ -118,7 +118,7 @@ def parse_args():
     parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5)
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    parser.add_argument('--device', type=str, default='cuda:1')
     parser.add_argument('--use-wandb', action='store_true', help='Enable wandb logging')
     parser.add_argument('--use-tensorboard', action='store_true', help='Enable TensorBoard logging')
     parser.add_argument('--wandb_project', type=str, default='lightweight-stroke')
