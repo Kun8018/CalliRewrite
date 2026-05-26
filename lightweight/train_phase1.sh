@@ -19,9 +19,10 @@ python train.py \
   --output_dir output_ar_phase1 \
   --image_size 256 \
   --max_seq_len 100 \
-  --chunk_len 8 \
+  --chunk_len 16 \
   --chunks_per_sample 4 \
-  --batch_size 8 \
+  --batch_size 128 \
   --epochs 50 \
+  --num_workers 16 \
   --device cuda:1 \
   --use-tensorboard

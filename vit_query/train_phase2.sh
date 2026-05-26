@@ -15,9 +15,10 @@ python train.py \
   --mode seq7 \
   --img_size 224 \
   --seq_len 100 \
-  --chunk_len 8 \
+  --chunk_len 16 \
   --chunks_per_sample 4 \
-  --batch_size 8 \
+  --batch_size 64 \
   --epochs 50 \
+  --num_workers 16 \
   --device cuda:0 \
   --use-tensorboard
