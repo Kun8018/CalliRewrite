@@ -3,6 +3,7 @@
 ResNet-18 lightweight stroke extraction training.
 """
 import os
+import sys
 import csv
 import argparse
 import torch
@@ -98,9 +99,9 @@ def parse_args():
     parser.add_argument('--dataset_root', type=str, default='../seq_extract/datasets')
     parser.add_argument('--data_dir', type=str, default=None)
     parser.add_argument('--quickdraw_npz', type=str, default=None)
-    parser.add_argument('--quickdraw_save_dir', type=str, default='./qd_data')
+    parser.add_argument('--quickdraw_save_dir', type=str, default='./qd_data_lightweight')
     parser.add_argument('--phase1_checkpoint', type=str, default=None)
-    parser.add_argument('--output_dir', type=str, default='./output')
+    parser.add_argument('--output_dir', type=str, default='./output_lightweight')
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -292,9 +293,35 @@ def save_checkpoint(model, optimizer, epoch, loss, save_path, args):
     print(f'Checkpoint saved to {save_path}')
 
 
+class Tee:
+    """同时输出到终端和文件"""
+    def __init__(self, file_path):
+        self.terminal = sys.stdout
+        self.log = open(file_path, 'w', buffering=1)
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def close(self):
+        self.log.close()
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # 全程日志
+    training_log = os.path.join(args.output_dir, 'training.log')
+    tee = Tee(training_log)
+    sys.stdout = tee
+    sys.stderr = tee
+    print(f'Training log saved to: {training_log}')
+
     device = torch.device(args.device)
     print(f'Using device: {device}')
     print(f'Arch: {args.arch}, Phase: {args.phase}')
@@ -410,6 +437,27 @@ def main():
     if args.use_wandb and WANDB_AVAILABLE:
         wandb.finish()
 
+    # 恢复 stdout/stderr 并关闭 tee
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+    tee.close()
+
 
 if __name__ == '__main__':
-    main()
+    import traceback
+    try:
+        main()
+    except Exception as e:
+        # 记录报错到文件
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--output_dir', type=str, default='./output_lightweight')
+        temp_args, _ = parser.parse_known_args()
+        os.makedirs(temp_args.output_dir, exist_ok=True)
+        error_log = os.path.join(temp_args.output_dir, 'error.log')
+        with open(error_log, 'w') as f:
+            f.write(f'Error: {e}\n')
+            f.write(traceback.format_exc())
+        print(f'Error logged to {error_log}')
+        traceback.print_exc()
+        sys.exit(1)

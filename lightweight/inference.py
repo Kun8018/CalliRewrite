@@ -18,7 +18,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Lightweight Stroke Inference')
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--input', type=str, required=True)
-    parser.add_argument('--output_dir', type=str, default='./inference_output')
+    parser.add_argument('--output_dir', type=str, default='./inference_output_lightweight')
     parser.add_argument('--arch', type=str, default=None, choices=['autoregressive', 'oneshot'])
     parser.add_argument('--image_size', type=int, default=None)
     parser.add_argument('--max_seq_len', type=int, default=None)

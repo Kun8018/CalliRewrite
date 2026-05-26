@@ -258,7 +258,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='ViT Trajectory Inference')
     parser.add_argument('--checkpoint', type=str, required=True, help='模型权重')
     parser.add_argument('--input', type=str, required=True, help='输入图像/目录')
-    parser.add_argument('--output_dir', type=str, default='./inference_output', help='输出目录')
+    parser.add_argument('--output_dir', type=str, default='./inference_output_vit_query', help='输出目录')
     parser.add_argument('--img_size', type=int, default=224)
     parser.add_argument('--seq_len', type=int, default=100)
     parser.add_argument('--embed_dim', type=int, default=192)
