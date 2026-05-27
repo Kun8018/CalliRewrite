@@ -21,6 +21,7 @@ python train.py \
   --mode seq7 \
   --img_size 224 \
   --seq_len 100 \
+  --embed_dim 256 \
   --batch_size 32 \
   --epochs 100 \
   --lr 1e-4 \

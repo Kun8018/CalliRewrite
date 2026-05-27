@@ -179,6 +179,7 @@ def parse_args():
     parser.add_argument('--num_points', type=int, default=100, help='2D 模式的点数')
     parser.add_argument('--seq_len', type=int, default=100, help='7D 模式的序列长度')
     parser.add_argument('--embed_dim', type=int, default=192)
+    parser.add_argument('--num_heads', type=int, default=None, help='transformer attention heads, auto-selected if None')
     parser.add_argument('--mode', type=str, default='seq7', choices=['seq7', 'points'],
                         help='输出模式: seq7 或 points；两阶段建议用 seq7')
     parser.add_argument('--arch', type=str, default='autoregressive', choices=['autoregressive', 'oneshot'],
@@ -505,27 +506,30 @@ def main():
         model = ViTAutoregressiveExtractor7D(
             img_size=args.img_size,
             seq_len=args.seq_len,
-            embed_dim=args.embed_dim
+            embed_dim=args.embed_dim,
+            num_heads=args.num_heads
         ).to(device)
         if args.phase == 2:
-            criterion = UnsupervisedLoss(img_size=args.img_size)
+            criterion = UnsupervisedLoss(img_size=args.img_size).to(device)
         else:
             criterion = AutoregressiveTrajectoryLoss7D()
     elif args.mode == 'seq7':
         model = ViTTrajectoryExtractor7D(
             img_size=args.img_size,
             seq_len=args.seq_len,
-            embed_dim=args.embed_dim
+            embed_dim=args.embed_dim,
+            num_heads=args.num_heads
         ).to(device)
         if args.phase == 2:
-            criterion = UnsupervisedLoss(img_size=args.img_size)
+            criterion = UnsupervisedLoss(img_size=args.img_size).to(device)
         else:
             criterion = TrajectoryLoss7D()
     else:
         model = ViTTrajectoryExtractor(
             img_size=args.img_size,
             num_points=args.num_points,
-            embed_dim=args.embed_dim
+            embed_dim=args.embed_dim,
+            num_heads=args.num_heads
         ).to(device)
         criterion = TrajectoryLoss2D()
 

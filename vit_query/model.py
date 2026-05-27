@@ -11,11 +11,19 @@ from torchvision.models import vit_b_16, ViT_B_16_Weights
 class ViTTinyPatch16X16(nn.Module):
     """极简 ViT-Tiny，兼容 timm 接口风格"""
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=1, embed_dim=192, depth=12, num_heads=3):
+    def __init__(self, img_size=224, patch_size=16, in_chans=1, embed_dim=192, depth=12, num_heads=None):
         super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = (img_size // patch_size) ** 2
+
+        # 自动选择合适的 num_heads（必须能整除 embed_dim）
+        if num_heads is None:
+            for n in [16, 8, 4, 2, 1]:
+                if embed_dim % n == 0:
+                    num_heads = n
+                    break
+        assert embed_dim % num_heads == 0, f"embed_dim {embed_dim} must be divisible by num_heads {num_heads}"
 
         # Patch embedding
         self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
@@ -63,7 +71,7 @@ class ViTTinyPatch16X16(nn.Module):
 class ViTTinyBackbone(nn.Module):
     """使用 torchvision 的 ViT-Base 简化到 tiny 规模，或直接用极简实现"""
 
-    def __init__(self, img_size=224, patch_size=16, in_chans=1, embed_dim=192, pretrained=False):
+    def __init__(self, img_size=224, patch_size=16, in_chans=1, embed_dim=192, pretrained=False, num_heads=None):
         super().__init__()
 
         # 使用我们自己的极简实现
@@ -73,7 +81,7 @@ class ViTTinyBackbone(nn.Module):
             in_chans=in_chans,
             embed_dim=embed_dim,
             depth=12,
-            num_heads=3
+            num_heads=num_heads
         )
 
         self.patch_size = patch_size
@@ -176,7 +184,7 @@ class ViTTrajectoryExtractor7D(nn.Module):
          [pen_state, x1, y1, x2, y2, r, s]
     """
 
-    def __init__(self, img_size=224, seq_len=100, embed_dim=192, num_queries=None):
+    def __init__(self, img_size=224, seq_len=100, embed_dim=192, num_queries=None, num_heads=None):
         super().__init__()
 
         self.img_size = img_size
@@ -186,12 +194,21 @@ class ViTTrajectoryExtractor7D(nn.Module):
         if num_queries is None:
             num_queries = seq_len
 
+        # 自动选择合适的 num_heads（必须能整除 embed_dim）
+        if num_heads is None:
+            for n in [16, 8, 4, 2, 1]:
+                if embed_dim % n == 0:
+                    num_heads = n
+                    break
+        assert embed_dim % num_heads == 0, f"embed_dim {embed_dim} must be divisible by num_heads {num_heads}"
+
         # ViT 骨干网络
         self.vit_backbone = ViTTinyBackbone(
             img_size=img_size,
             patch_size=16,
             in_chans=1,
-            embed_dim=embed_dim
+            embed_dim=embed_dim,
+            num_heads=num_heads
         )
 
         # Trajectory Queries
@@ -201,7 +218,7 @@ class ViTTrajectoryExtractor7D(nn.Module):
         # Transformer Decoder
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=embed_dim,
-            nhead=4,
+            nhead=num_heads,
             dim_feedforward=embed_dim * 4,
             dropout=0.1,
             batch_first=True
@@ -247,18 +264,27 @@ class ViTTrajectoryExtractor7D(nn.Module):
 class ViTAutoregressiveExtractor7D(nn.Module):
     """自回归版：target image + current canvas/cursor -> next 7D stroke."""
 
-    def __init__(self, img_size=224, seq_len=100, embed_dim=192, hidden_dim=256):
+    def __init__(self, img_size=224, seq_len=100, embed_dim=192, hidden_dim=256, num_heads=None):
         super().__init__()
         self.img_size = img_size
         self.seq_len = seq_len
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
 
+        # 自动选择合适的 num_heads（必须能整除 embed_dim）
+        if num_heads is None:
+            for n in [16, 8, 4, 2, 1]:
+                if embed_dim % n == 0:
+                    num_heads = n
+                    break
+        assert embed_dim % num_heads == 0, f"embed_dim {embed_dim} must be divisible by num_heads {num_heads}"
+
         self.vit_backbone = ViTTinyBackbone(
             img_size=img_size,
             patch_size=16,
             in_chans=1,
-            embed_dim=embed_dim
+            embed_dim=embed_dim,
+            num_heads=num_heads
         )
         self.target_pool = nn.LayerNorm(embed_dim)
 
@@ -278,7 +304,7 @@ class ViTAutoregressiveExtractor7D(nn.Module):
         self.prev_stroke_mlp = nn.Sequential(nn.Linear(7, embed_dim), nn.GELU(), nn.LayerNorm(embed_dim))
         self.step_mlp = nn.Sequential(nn.Linear(1, embed_dim), nn.GELU(), nn.LayerNorm(embed_dim))
         self.state_query_norm = nn.LayerNorm(embed_dim)
-        self.target_attn = nn.MultiheadAttention(embed_dim, num_heads=4, batch_first=True)
+        self.target_attn = nn.MultiheadAttention(embed_dim, num_heads=num_heads, batch_first=True)
 
         self.gru_input = nn.Sequential(
             nn.Linear(embed_dim * 5, hidden_dim),

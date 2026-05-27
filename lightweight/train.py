@@ -160,7 +160,8 @@ def parse_args():
     parser.add_argument('--chunks_per_sample', type=int, default=4)
     parser.add_argument('--max_items_per_category', type=int, default=None)
     parser.add_argument('--d_model', type=int, default=256)
-    parser.add_argument('--nhead', type=int, default=4)
+    parser.add_argument('--nhead', type=int, default=None)
+    parser.add_argument('--num_heads', type=int, default=None)
     parser.add_argument('--num_decoder_layers', type=int, default=3)
     parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5)
     parser.add_argument('--val_split', type=float, default=0.1)
@@ -244,10 +245,11 @@ def build_model_and_loss(args, device):
         model = ResNetAutoregressiveExtractor7D(
             image_size=args.image_size,
             max_seq_len=args.max_seq_len,
-            d_model=args.d_model
+            d_model=args.d_model,
+            num_heads=args.num_heads
         ).to(device)
         if args.phase == 2:
-            criterion = UnsupervisedLoss(image_size=args.image_size)
+            criterion = UnsupervisedLoss(image_size=args.image_size).to(device)
         else:
             criterion = AutoregressiveTrajectoryLoss7D()
     else:
@@ -258,7 +260,7 @@ def build_model_and_loss(args, device):
             max_seq_len=args.max_seq_len
         ).to(device)
         if args.phase == 2:
-            criterion = UnsupervisedLoss(image_size=args.image_size)
+            criterion = UnsupervisedLoss(image_size=args.image_size).to(device)
         else:
             criterion = StrokeLoss()
     return model, criterion

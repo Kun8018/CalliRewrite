@@ -17,7 +17,7 @@ class StrokeTransformer(nn.Module):
     def __init__(
         self,
         d_model=256,
-        nhead=4,
+        nhead=None,
         num_decoder_layers=3,
         max_seq_len=100,
         dropout=0.1
@@ -26,6 +26,15 @@ class StrokeTransformer(nn.Module):
 
         self.d_model = d_model
         self.max_seq_len = max_seq_len
+
+        # 自动选择合适的 nhead（必须能整除 d_model）
+        if nhead is None:
+            for n in [16, 8, 4, 2, 1]:
+                if d_model % n == 0:
+                    nhead = n
+                    break
+        assert d_model % nhead == 0, f"d_model {d_model} must be divisible by nhead {nhead}"
+        self.nhead = nhead
 
         # ========== 1. ResNet-18 编码器 ==========
         resnet = resnet18(weights=None)
@@ -251,12 +260,21 @@ class ResNetFeatureBackbone(nn.Module):
 
 
 class ResNetAutoregressiveExtractor7D(nn.Module):
-    def __init__(self, image_size=256, max_seq_len=100, d_model=256, hidden_dim=256):
+    def __init__(self, image_size=256, max_seq_len=100, d_model=256, hidden_dim=256, num_heads=None):
         super().__init__()
         self.image_size = image_size
         self.max_seq_len = max_seq_len
         self.d_model = d_model
         self.hidden_dim = hidden_dim
+
+        # 自动选择合适的 num_heads（必须能整除 d_model）
+        if num_heads is None:
+            for n in [16, 8, 4, 2, 1]:
+                if d_model % n == 0:
+                    num_heads = n
+                    break
+        assert d_model % num_heads == 0, f"d_model {d_model} must be divisible by num_heads {num_heads}"
+        self.num_heads = num_heads
 
         self.target_backbone = ResNetFeatureBackbone(image_size=image_size, d_model=d_model)
         self.target_pool = nn.LayerNorm(d_model)
@@ -275,7 +293,7 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
         self.prev_stroke_mlp = nn.Sequential(nn.Linear(7, d_model), nn.GELU(), nn.LayerNorm(d_model))
         self.step_mlp = nn.Sequential(nn.Linear(1, d_model), nn.GELU(), nn.LayerNorm(d_model))
         self.state_query_norm = nn.LayerNorm(d_model)
-        self.target_attn = nn.MultiheadAttention(d_model, num_heads=4, batch_first=True)
+        self.target_attn = nn.MultiheadAttention(d_model, num_heads=num_heads, batch_first=True)
         self.gru_input = nn.Sequential(
             nn.Linear(d_model * 5, hidden_dim),
             nn.GELU(),
