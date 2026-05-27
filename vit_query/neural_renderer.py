@@ -52,12 +52,12 @@ class NeuralRasterizorStep(nn.Module):
         super().__init__()
         self.raster_size = raster_size
         self.position_format = position_format
-        self.raster_unit = RasterUnit(raster_size)
+        self.raster_unit = RasterUnit(128)  # RasterUnit 固定输出 128
 
     def raster_func_stroke_abs(self, input_data):
         """
         input_data: (N, 8) [x0, y0, x1, y1, x2, y2, r0, r2] in [0, 1]
-        returns: (N, raster_size, raster_size) [0.0-BG, 1.0-stroke]
+        returns: (N, 128, 128) [0.0-BG, 1.0-stroke]
         """
         w_in = torch.ones(input_data.shape[0], 2, device=input_data.device)
         raster_params = torch.cat([input_data, w_in], dim=-1)
@@ -72,7 +72,8 @@ class NeuralRasterizorStep(nn.Module):
         returns: (N, raster_size, raster_size) [0.0-BG, 1.0-stroke]
         """
         N, seq_len, D = strokes.shape
-        canvas = torch.zeros(N, self.raster_size, self.raster_size, device=strokes.device)
+        # RasterUnit 固定输出 128x128
+        canvas = torch.zeros(N, 128, 128, device=strokes.device)
 
         for i in range(seq_len):
             stroke = strokes[:, i, :]
@@ -82,6 +83,15 @@ class NeuralRasterizorStep(nn.Module):
                 stroke_params = stroke
             stroke_img = self.raster_func_stroke_abs(stroke_params)
             canvas = torch.clamp(canvas + stroke_img, 0.0, 1.0)
+
+        # 如果目标不是 128，则插值
+        if self.raster_size != 128:
+            canvas = F.interpolate(
+                canvas.unsqueeze(1),
+                size=(self.raster_size, self.raster_size),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)
 
         return canvas
 
