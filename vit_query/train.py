@@ -16,7 +16,9 @@ from torch.utils.data import random_split
 from tqdm import tqdm
 
 from model import ViTTrajectoryExtractor, ViTTrajectoryExtractor7D, ViTAutoregressiveExtractor7D, count_parameters
-from dataset import StrokeDatasetViT, QuickDrawCleanDatasetViT
+from dataset import StrokeDatasetViT, QuickDrawCleanDatasetViT, ImageOnlyDatasetViT, initial_seq7_state, apply_seq7_step
+from neural_renderer import NeuralRasterizorStep, seq7_to_absolute
+from vgg_loss import VGG16PerceptualLoss
 
 try:
     import wandb
@@ -112,14 +114,61 @@ class AutoregressiveTrajectoryLoss7D(nn.Module):
         return {'total': total_loss, 'pen': pen_loss, 'coord': coord_loss, 'param': param_loss}
 
 
+class UnsupervisedLoss(nn.Module):
+    """无监督训练损失：渲染损失 + 感知损失"""
+
+    def __init__(self, render_weight=1.0, perceptual_weight=1.0, img_size=224):
+        super().__init__()
+        self.render_weight = render_weight
+        self.perceptual_weight = perceptual_weight
+        self.l1_loss = nn.L1Loss()
+        self.renderer = NeuralRasterizorStep(img_size)
+        self.perceptual_loss = VGG16PerceptualLoss()
+        self.img_size = img_size
+
+    def forward(self, strokes_seq7, target_images):
+        """
+        strokes_seq7: (N, seq_len, 7) - 模型输出的 seq7 格式
+        target_images: (N, 1, img_size, img_size) or (N, img_size, img_size) - 目标图像
+        """
+        # 将 seq7 转换为绝对坐标格式
+        strokes_abs = seq7_to_absolute(strokes_seq7, self.img_size)
+
+        # 渲染图像
+        rendered = self.renderer(strokes_abs)  # (N, img_size, img_size) [0.0-BG, 1.0-stroke]
+
+        # 处理 target_images 的维度和格式
+        if target_images.dim() == 4 and target_images.size(1) == 1:
+            target_images = target_images.squeeze(1)  # (N, H, W)
+
+        # 确保 target_images 是 [0.0-BG, 1.0-stroke] 格式
+        # 如果输入是 [0.0-stroke, 1.0-BG]，需要反转
+        if target_images.min() >= 0.0 and target_images.max() <= 1.0:
+            # 检查是否需要反转：假设目标图像中笔画是深色（低值）
+            if target_images.mean() > 0.5:
+                target_images = 1.0 - target_images
+
+        render_loss = self.l1_loss(rendered, target_images)
+        perc_loss = self.perceptual_loss(
+            rendered.unsqueeze(1),
+            target_images.unsqueeze(1)
+        )
+        total_loss = self.render_weight * render_loss + self.perceptual_weight * perc_loss
+        return {
+            'total': total_loss,
+            'render': render_loss,
+            'perceptual': perc_loss
+        }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Train ViT Trajectory Extractor')
     parser.add_argument('--phase', type=int, default=1, choices=[1, 2],
-                        help='1=QuickDraw-clean 预训练, 2=书法数据 fine-tune')
+                        help='1=QuickDraw-clean 预训练, 2=书法数据无监督 fine-tune')
     parser.add_argument('--dataset_root', type=str, default='../seq_extract/datasets',
                         help='seq_extract 数据根目录，phase1 默认读取 QuickDraw-clean')
     parser.add_argument('--data_dir', type=str, default=None,
-                        help='phase2 监督数据目录，要求 .png/.jpg + 同名 .npz')
+                        help='phase2 数据目录，只需要 .png/.jpg 图片')
     parser.add_argument('--phase1_checkpoint', type=str, default=None,
                         help='phase2 从 phase1 checkpoint 初始化')
     parser.add_argument('--output_dir', type=str, default='./output_vit_query', help='输出目录')
@@ -148,7 +197,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
+def train_epoch(model, dataloader, optimizer, criterion, device, epoch, unsupervised=False):
     model.train()
     total_loss = 0.0
     loss_components = {}
@@ -157,28 +206,56 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
     for batch in pbar:
         optimizer.zero_grad()
 
-        if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
-            outputs = model.forward_teacher_forcing(
-                batch['target_mask'].to(device),
-                batch['canvases'].to(device),
-                batch['cursors'].to(device),
-                batch['prev_strokes'].to(device),
-                batch['step_indices'].to(device)
-            )
-            targets = batch['strokes'].to(device)
-            mask = batch['mask'].to(device)
-            losses = criterion(outputs, targets, mask)
-        elif model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+        if unsupervised:
             images = batch['image'].to(device)
-            targets = batch['strokes'].to(device)
-            mask = batch['mask'].to(device)
-            predictions = model(images)
-            losses = criterion(predictions, targets, mask)
+            if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
+                # 注意：autoregressive 模型的完整推理循环不可微，
+                # phase2 推荐使用 ViTTrajectoryExtractor7D (oneshot)
+                # 这里作为 fallback，仍然使用 no_grad
+                with torch.no_grad():
+                    target_mask = 1.0 - images
+                    target_tokens, target_global = model.encode_target(target_mask)
+                    state = initial_seq7_state(model.img_size)
+                    hidden = None
+                    strokes_list = []
+                    for i in range(model.seq_len):
+                        canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0)
+                        cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
+                        prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
+                        step_index = torch.tensor([[i / model.seq_len]], dtype=torch.float32, device=device)
+                        output, hidden = model.forward_step(target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden)
+                        stroke = output['seq'].squeeze(0).detach()
+                        strokes_list.append(stroke)
+                        state = apply_seq7_step(state, stroke.cpu().numpy(), model.img_size)
+                    strokes = torch.stack(strokes_list, dim=0).unsqueeze(0)
+                losses = criterion(strokes, images)
+            else:
+                # oneshot 模型可以端到端训练
+                strokes = model(images)
+                losses = criterion(strokes, images)
         else:
-            images = batch['image'].to(device)
-            targets = batch['points'].to(device)
-            predictions = model(images)
-            losses = criterion(predictions, targets)
+            if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
+                outputs = model.forward_teacher_forcing(
+                    batch['target_mask'].to(device),
+                    batch['canvases'].to(device),
+                    batch['cursors'].to(device),
+                    batch['prev_strokes'].to(device),
+                    batch['step_indices'].to(device)
+                )
+                targets = batch['strokes'].to(device)
+                mask = batch['mask'].to(device)
+                losses = criterion(outputs, targets, mask)
+            elif model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+                images = batch['image'].to(device)
+                targets = batch['strokes'].to(device)
+                mask = batch['mask'].to(device)
+                predictions = model(images)
+                losses = criterion(predictions, targets, mask)
+            else:
+                images = batch['image'].to(device)
+                targets = batch['points'].to(device)
+                predictions = model(images)
+                losses = criterion(predictions, targets)
 
         loss = losses['total']
         loss.backward()
@@ -197,35 +274,57 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch):
 
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, epoch):
+def validate(model, dataloader, criterion, device, epoch, unsupervised=False):
     model.eval()
     total_loss = 0.0
     loss_components = {}
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Val]')
 
     for batch in pbar:
-        if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
-            outputs = model.forward_teacher_forcing(
-                batch['target_mask'].to(device),
-                batch['canvases'].to(device),
-                batch['cursors'].to(device),
-                batch['prev_strokes'].to(device),
-                batch['step_indices'].to(device)
-            )
-            targets = batch['strokes'].to(device)
-            mask = batch['mask'].to(device)
-            losses = criterion(outputs, targets, mask)
-        elif model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+        if unsupervised:
             images = batch['image'].to(device)
-            targets = batch['strokes'].to(device)
-            mask = batch['mask'].to(device)
-            predictions = model(images)
-            losses = criterion(predictions, targets, mask)
+            if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
+                target_mask = 1.0 - images
+                target_tokens, target_global = model.encode_target(target_mask)
+                state = initial_seq7_state(model.img_size)
+                hidden = None
+                strokes_list = []
+                for i in range(model.seq_len):
+                    canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0)
+                    cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
+                    prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
+                    step_index = torch.tensor([[i / model.seq_len]], dtype=torch.float32, device=device)
+                    output, hidden = model.forward_step(target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden)
+                    stroke = output['seq'].squeeze(0).detach()
+                    strokes_list.append(stroke)
+                    state = apply_seq7_step(state, stroke.cpu().numpy(), model.img_size)
+                strokes = torch.stack(strokes_list, dim=0).unsqueeze(0)
+            else:
+                strokes = model(images)
+            losses = criterion(strokes, images)
         else:
-            images = batch['image'].to(device)
-            targets = batch['points'].to(device)
-            predictions = model(images)
-            losses = criterion(predictions, targets)
+            if model.__class__.__name__ == 'ViTAutoregressiveExtractor7D':
+                outputs = model.forward_teacher_forcing(
+                    batch['target_mask'].to(device),
+                    batch['canvases'].to(device),
+                    batch['cursors'].to(device),
+                    batch['prev_strokes'].to(device),
+                    batch['step_indices'].to(device)
+                )
+                targets = batch['strokes'].to(device)
+                mask = batch['mask'].to(device)
+                losses = criterion(outputs, targets, mask)
+            elif model.__class__.__name__ == 'ViTTrajectoryExtractor7D':
+                images = batch['image'].to(device)
+                targets = batch['strokes'].to(device)
+                mask = batch['mask'].to(device)
+                predictions = model(images)
+                losses = criterion(predictions, targets, mask)
+            else:
+                images = batch['image'].to(device)
+                targets = batch['points'].to(device)
+                predictions = model(images)
+                losses = criterion(predictions, targets)
 
         total_loss += losses['total'].item()
         for k, v in losses.items():
@@ -288,6 +387,7 @@ def build_dataset(args):
         )
         return train_dataset, val_dataset
 
+    # Phase2: 无监督训练，只需要图片
     if args.data_dir is None:
         possible_dirs = [
             '../seq_extract/outputs/__new_train_phase_2',
@@ -300,20 +400,16 @@ def build_dataset(args):
                 break
 
     if args.data_dir is None:
-        raise ValueError('phase2 needs --data_dir with .png/.jpg + same-name .npz labels')
+        raise ValueError('phase2 needs --data_dir with .png/.jpg images')
 
-    full_dataset = StrokeDatasetViT(
+    # Phase2 使用 ImageOnlyDatasetViT，不需要 npz
+    full_dataset = ImageOnlyDatasetViT(
         data_dir=args.data_dir,
         img_size=args.img_size,
-        num_points=args.num_points,
-        seq_len=args.seq_len,
-        mode=args.mode,
-        arch=args.arch,
-        chunk_len=args.chunk_len,
-        chunks_per_sample=args.chunks_per_sample
+        mode=args.mode
     )
     if len(full_dataset) == 0:
-        raise ValueError('No data found!')
+        raise ValueError('No images found in data_dir!')
 
     val_size = max(1, int(len(full_dataset) * args.val_split)) if len(full_dataset) > 1 else 0
     train_size = len(full_dataset) - val_size
@@ -368,7 +464,9 @@ def main():
     # Write header based on mode/arch
     header = ['epoch', 'train_loss', 'val_loss', 'best_val_loss']
     # Add loss components
-    if args.mode == 'seq7' or args.arch == 'autoregressive':
+    if args.phase == 2:
+        header.extend(['train_render', 'train_perceptual', 'val_render', 'val_perceptual'])
+    elif args.mode == 'seq7' or args.arch == 'autoregressive':
         header.extend(['train_pen', 'train_coord', 'train_param', 'val_pen', 'val_coord', 'val_param'])
     else:
         header.extend(['train_l1', 'train_mse', 'val_l1', 'val_mse'])
@@ -409,14 +507,20 @@ def main():
             seq_len=args.seq_len,
             embed_dim=args.embed_dim
         ).to(device)
-        criterion = AutoregressiveTrajectoryLoss7D()
+        if args.phase == 2:
+            criterion = UnsupervisedLoss(img_size=args.img_size)
+        else:
+            criterion = AutoregressiveTrajectoryLoss7D()
     elif args.mode == 'seq7':
         model = ViTTrajectoryExtractor7D(
             img_size=args.img_size,
             seq_len=args.seq_len,
             embed_dim=args.embed_dim
         ).to(device)
-        criterion = TrajectoryLoss7D()
+        if args.phase == 2:
+            criterion = UnsupervisedLoss(img_size=args.img_size)
+        else:
+            criterion = TrajectoryLoss7D()
     else:
         model = ViTTrajectoryExtractor(
             img_size=args.img_size,
@@ -434,9 +538,10 @@ def main():
     best_val_loss = float('inf')
 
     print('Starting training...')
+    unsupervised = (args.phase == 2)
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_comp = train_epoch(model, train_loader, optimizer, criterion, device, epoch)
-        val_loss, val_comp = validate(model, val_loader, criterion, device, epoch)
+        train_loss, train_comp = train_epoch(model, train_loader, optimizer, criterion, device, epoch, unsupervised)
+        val_loss, val_comp = validate(model, val_loader, criterion, device, epoch, unsupervised)
         scheduler.step()
 
         print(f'\nEpoch {epoch}/{args.epochs}')
@@ -445,7 +550,12 @@ def main():
 
         # CSV logging
         csv_row = [epoch, train_loss, val_loss, best_val_loss]
-        if args.mode == 'seq7' or args.arch == 'autoregressive':
+        if args.phase == 2:
+            csv_row.extend([
+                train_comp.get('render', 0.0), train_comp.get('perceptual', 0.0),
+                val_comp.get('render', 0.0), val_comp.get('perceptual', 0.0)
+            ])
+        elif args.mode == 'seq7' or args.arch == 'autoregressive':
             csv_row.extend([
                 train_comp.get('pen', 0.0), train_comp.get('coord', 0.0), train_comp.get('param', 0.0),
                 val_comp.get('pen', 0.0), val_comp.get('coord', 0.0), val_comp.get('param', 0.0)

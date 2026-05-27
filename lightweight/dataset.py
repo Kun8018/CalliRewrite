@@ -20,6 +20,39 @@ QUICKDRAW_CATEGORIES = [
 ]
 
 
+class ImageOnlyDataset(Dataset):
+    """Phase2 无监督数据集：只读取图片，不需要 npz 标注。"""
+
+    def __init__(self, data_dir=None, image_files=None, image_size=256, mode='seq7'):
+        self.image_size = image_size
+        self.mode = mode
+        self.samples = []
+
+        if image_files is not None:
+            self.samples.extend(image_files)
+
+        if data_dir is not None:
+            self._load_from_dir(data_dir)
+
+        print(f"Loaded {len(self.samples)} image-only samples (mode: {mode})")
+
+    def _load_from_dir(self, data_dir):
+        image_extensions = ('.png', '.jpg', '.jpeg')
+        for root, _, files in os.walk(data_dir):
+            for f in sorted(files):
+                if f.lower().endswith(image_extensions):
+                    self.samples.append(os.path.join(root, f))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        image_path = self.samples[idx]
+        # phase2 用 zero_one 格式
+        image = load_grayscale_tensor(image_path, self.image_size, normalize='zero_one')
+        return {'image': image, 'image_path': image_path}
+
+
 class StrokeDataset(Dataset):
     """笔画数据集：读取同名 .png/.jpg + .npz。"""
 

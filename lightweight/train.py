@@ -25,7 +25,9 @@ except ImportError:
     TENSORBOARD_AVAILABLE = False
 
 from model import StrokeTransformer, ResNetAutoregressiveExtractor7D, count_parameters
-from dataset import StrokeDataset, QuickDrawCleanDataset, QuickDrawConverter
+from dataset import StrokeDataset, QuickDrawCleanDataset, QuickDrawConverter, ImageOnlyDataset, initial_seq7_state, apply_seq7_step
+from neural_renderer import NeuralRasterizorStep, seq7_to_absolute
+from vgg_loss import VGG16PerceptualLoss
 
 
 class StrokeLoss(nn.Module):
@@ -90,6 +92,51 @@ class AutoregressiveTrajectoryLoss7D(nn.Module):
             self.weight_param * param_loss
         )
         return {'total': total_loss, 'pen': pen_loss, 'coord': coord_loss, 'param': param_loss}
+
+
+class UnsupervisedLoss(nn.Module):
+    """无监督训练损失：渲染损失 + 感知损失"""
+
+    def __init__(self, render_weight=1.0, perceptual_weight=1.0, image_size=256):
+        super().__init__()
+        self.render_weight = render_weight
+        self.perceptual_weight = perceptual_weight
+        self.l1_loss = nn.L1Loss()
+        self.renderer = NeuralRasterizorStep(image_size)
+        self.perceptual_loss = VGG16PerceptualLoss()
+        self.image_size = image_size
+
+    def forward(self, strokes_seq7, target_images):
+        """
+        strokes_seq7: (N, seq_len, 7) - 模型输出的 seq7 格式
+        target_images: (N, 1, H, W) or (N, H, W) - 目标图像
+        """
+        # 将 seq7 转换为绝对坐标格式
+        strokes_abs = seq7_to_absolute(strokes_seq7, self.image_size)
+
+        # 渲染图像
+        rendered = self.renderer(strokes_abs)  # (N, H, W) [0.0-BG, 1.0-stroke]
+
+        # 处理 target_images 的维度和格式
+        if target_images.dim() == 4 and target_images.size(1) == 1:
+            target_images = target_images.squeeze(1)
+
+        # 确保 target_images 是 [0.0-BG, 1.0-stroke] 格式
+        if target_images.min() >= 0.0 and target_images.max() <= 1.0:
+            if target_images.mean() > 0.5:
+                target_images = 1.0 - target_images
+
+        render_loss = self.l1_loss(rendered, target_images)
+        perc_loss = self.perceptual_loss(
+            rendered.unsqueeze(1),
+            target_images.unsqueeze(1)
+        )
+        total_loss = self.render_weight * render_loss + self.perceptual_weight * perc_loss
+        return {
+            'total': total_loss,
+            'render': render_loss,
+            'perceptual': perc_loss
+        }
 
 
 def parse_args():
@@ -166,18 +213,25 @@ def build_dataset(args):
             max_items=args.max_items_per_category or 50000
         )
     if args.data_dir is None:
-        raise ValueError('phase2 needs --data_dir with .png/.jpg + same-name .npz labels')
+        possible_dirs = [
+            '../seq_extract/outputs/__new_train_phase_2',
+            '../rl_finetune/data/train_data',
+        ]
+        for d in possible_dirs:
+            if os.path.exists(d):
+                args.data_dir = d
+                print(f'Using phase2 data dir: {d}')
+                break
+    if args.data_dir is None:
+        raise ValueError('phase2 needs --data_dir with .png/.jpg images')
 
-    full_dataset = StrokeDataset(
+    # Phase2 用 ImageOnlyDataset，不需要 npz
+    full_dataset = ImageOnlyDataset(
         data_dir=args.data_dir,
-        image_size=args.image_size,
-        max_seq_len=args.max_seq_len,
-        arch=args.arch,
-        chunk_len=args.chunk_len,
-        chunks_per_sample=args.chunks_per_sample
+        image_size=args.image_size
     )
     if len(full_dataset) == 0:
-        raise ValueError('No data found!')
+        raise ValueError('No images found!')
     val_size = max(1, int(len(full_dataset) * args.val_split)) if len(full_dataset) > 1 else 0
     train_size = len(full_dataset) - val_size
     if val_size == 0:
@@ -192,7 +246,10 @@ def build_model_and_loss(args, device):
             max_seq_len=args.max_seq_len,
             d_model=args.d_model
         ).to(device)
-        criterion = AutoregressiveTrajectoryLoss7D()
+        if args.phase == 2:
+            criterion = UnsupervisedLoss(image_size=args.image_size)
+        else:
+            criterion = AutoregressiveTrajectoryLoss7D()
     else:
         model = StrokeTransformer(
             d_model=args.d_model,
@@ -200,7 +257,10 @@ def build_model_and_loss(args, device):
             num_decoder_layers=args.num_decoder_layers,
             max_seq_len=args.max_seq_len
         ).to(device)
-        criterion = StrokeLoss()
+        if args.phase == 2:
+            criterion = UnsupervisedLoss(image_size=args.image_size)
+        else:
+            criterion = StrokeLoss()
     return model, criterion
 
 
@@ -237,12 +297,41 @@ def run_batch(model, criterion, batch, device, arch, teacher_forcing_ratio=0.0):
 def train_epoch(model, dataloader, optimizer, criterion, device, epoch, args):
     model.train()
     total_loss = 0.0
-    loss_components = {'pen': 0.0, 'coord': 0.0, 'param': 0.0}
+    if args.phase == 2:
+        loss_components = {'render': 0.0, 'perceptual': 0.0}
+    else:
+        loss_components = {'pen': 0.0, 'coord': 0.0, 'param': 0.0}
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
 
     for batch in pbar:
         optimizer.zero_grad()
-        losses = run_batch(model, criterion, batch, device, args.arch, args.teacher_forcing_ratio)
+        if args.phase == 2:
+            images = batch['image'].to(device)
+            if args.arch == 'autoregressive':
+                # autoregressive 模型完整推理不可微，用 no_grad
+                with torch.no_grad():
+                    target_mask = 1.0 - images
+                    target_tokens, target_global = model.encode_target(target_mask)
+                    state = initial_seq7_state(model.image_size)
+                    hidden = None
+                    strokes_list = []
+                    for i in range(model.max_seq_len):
+                        canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0)
+                        cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
+                        prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
+                        step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
+                        output, hidden = model.forward_step(target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden)
+                        stroke = output['seq'].squeeze(0).detach()
+                        strokes_list.append(stroke)
+                        state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
+                    strokes_seq7 = torch.stack(strokes_list, dim=0).unsqueeze(0)
+                losses = criterion(strokes_seq7, images)
+            else:
+                # oneshot 模型可以端到端训练
+                strokes_seq7 = model(images)
+                losses = criterion(strokes_seq7, images)
+        else:
+            losses = run_batch(model, criterion, batch, device, args.arch, args.teacher_forcing_ratio)
         loss = losses['total']
         loss.backward()
         if args.grad_clip and args.grad_clip > 0:
@@ -251,7 +340,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, args):
 
         total_loss += loss.item()
         for k in loss_components:
-            loss_components[k] += losses[k].item()
+            if k in losses:
+                loss_components[k] += losses[k].item()
         pbar.set_postfix({'loss': loss.item()})
 
     num_batches = max(len(dataloader), 1)
@@ -264,14 +354,41 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, args):
 def validate(model, dataloader, criterion, device, epoch, args):
     model.eval()
     total_loss = 0.0
-    loss_components = {'pen': 0.0, 'coord': 0.0, 'param': 0.0}
+    if args.phase == 2:
+        loss_components = {'render': 0.0, 'perceptual': 0.0}
+    else:
+        loss_components = {'pen': 0.0, 'coord': 0.0, 'param': 0.0}
     pbar = tqdm(dataloader, desc=f'Epoch {epoch} [Val]')
 
     for batch in pbar:
-        losses = run_batch(model, criterion, batch, device, args.arch, 0.0)
+        if args.phase == 2:
+            images = batch['image'].to(device)
+            if args.arch == 'autoregressive':
+                target_mask = 1.0 - images
+                target_tokens, target_global = model.encode_target(target_mask)
+                state = initial_seq7_state(model.image_size)
+                hidden = None
+                strokes_list = []
+                for i in range(model.max_seq_len):
+                    canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0)
+                    cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
+                    prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
+                    step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
+                    output, hidden = model.forward_step(target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden)
+                    stroke = output['seq'].squeeze(0).detach()
+                    strokes_list.append(stroke)
+                    state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
+                strokes_seq7 = torch.stack(strokes_list, dim=0).unsqueeze(0)
+                losses = criterion(strokes_seq7, images)
+            else:
+                strokes_seq7 = model(images)
+                losses = criterion(strokes_seq7, images)
+        else:
+            losses = run_batch(model, criterion, batch, device, args.arch, 0.0)
         total_loss += losses['total'].item()
         for k in loss_components:
-            loss_components[k] += losses[k].item()
+            if k in losses:
+                loss_components[k] += losses[k].item()
         pbar.set_postfix({'loss': losses['total'].item()})
 
     num_batches = max(len(dataloader), 1)
@@ -336,10 +453,19 @@ def main():
     csv_path = os.path.join(args.output_dir, 'train_log.csv')
     csv_file = open(csv_path, 'w', buffering=1)  # line-buffered
     csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        'epoch',
-        'train_loss', 'train_pen', 'train_coord', 'train_param',
-        'val_loss', 'val_pen', 'val_coord', 'val_param',
+    # Write header based on phase
+    if args.phase == 2:
+        csv_writer.writerow([
+            'epoch',
+            'train_loss', 'train_render', 'train_perceptual',
+            'val_loss', 'val_render', 'val_perceptual',
+            'best_val_loss'
+        ])
+    else:
+        csv_writer.writerow([
+            'epoch',
+            'train_loss', 'train_pen', 'train_coord', 'train_param',
+            'val_loss', 'val_pen', 'val_coord', 'val_param',
         'best_val_loss'
     ])
     print(f'Training log saved to: {csv_path}')
@@ -387,27 +513,45 @@ def main():
         scheduler.step()
 
         print(f'\nEpoch {epoch}/{args.epochs}')
-        print(f'  Train Loss: {train_loss:.4f} (pen={train_comp["pen"]:.4f}, coord={train_comp["coord"]:.4f}, param={train_comp["param"]:.4f})')
-        print(f'  Val Loss: {val_loss:.4f} (pen={val_comp["pen"]:.4f}, coord={val_comp["coord"]:.4f}, param={val_comp["param"]:.4f})')
+        if args.phase == 2:
+            print(f'  Train Loss: {train_loss:.4f} (render={train_comp["render"]:.4f}, perceptual={train_comp["perceptual"]:.4f})')
+            print(f'  Val Loss: {val_loss:.4f} (render={val_comp["render"]:.4f}, perceptual={val_comp["perceptual"]:.4f})')
+        else:
+            print(f'  Train Loss: {train_loss:.4f} (pen={train_comp["pen"]:.4f}, coord={train_comp["coord"]:.4f}, param={train_comp["param"]:.4f})')
+            print(f'  Val Loss: {val_loss:.4f} (pen={val_comp["pen"]:.4f}, coord={val_comp["coord"]:.4f}, param={val_comp["param"]:.4f})')
 
         # CSV logging
-        csv_writer.writerow([
-            epoch,
-            train_loss, train_comp['pen'], train_comp['coord'], train_comp['param'],
-            val_loss, val_comp['pen'], val_comp['coord'], val_comp['param'],
-            best_val_loss
-        ])
+        if args.phase == 2:
+            csv_writer.writerow([
+                epoch,
+                train_loss, train_comp.get('render', 0.0), train_comp.get('perceptual', 0.0),
+                val_loss, val_comp.get('render', 0.0), val_comp.get('perceptual', 0.0),
+                best_val_loss
+            ])
+        else:
+            csv_writer.writerow([
+                epoch,
+                train_loss, train_comp.get('pen', 0.0), train_comp.get('coord', 0.0), train_comp.get('param', 0.0),
+                val_loss, val_comp.get('pen', 0.0), val_comp.get('coord', 0.0), val_comp.get('param', 0.0),
+                best_val_loss
+            ])
 
         # TensorBoard logging
         if writer:
             writer.add_scalar('Loss/train', train_loss, epoch)
-            writer.add_scalar('Loss/train_pen', train_comp['pen'], epoch)
-            writer.add_scalar('Loss/train_coord', train_comp['coord'], epoch)
-            writer.add_scalar('Loss/train_param', train_comp['param'], epoch)
             writer.add_scalar('Loss/val', val_loss, epoch)
-            writer.add_scalar('Loss/val_pen', val_comp['pen'], epoch)
-            writer.add_scalar('Loss/val_coord', val_comp['coord'], epoch)
-            writer.add_scalar('Loss/val_param', val_comp['param'], epoch)
+            if args.phase == 2:
+                writer.add_scalar('Loss/train_render', train_comp.get('render', 0.0), epoch)
+                writer.add_scalar('Loss/train_perceptual', train_comp.get('perceptual', 0.0), epoch)
+                writer.add_scalar('Loss/val_render', val_comp.get('render', 0.0), epoch)
+                writer.add_scalar('Loss/val_perceptual', val_comp.get('perceptual', 0.0), epoch)
+            else:
+                writer.add_scalar('Loss/train_pen', train_comp.get('pen', 0.0), epoch)
+                writer.add_scalar('Loss/train_coord', train_comp.get('coord', 0.0), epoch)
+                writer.add_scalar('Loss/train_param', train_comp.get('param', 0.0), epoch)
+                writer.add_scalar('Loss/val_pen', val_comp.get('pen', 0.0), epoch)
+                writer.add_scalar('Loss/val_coord', val_comp.get('coord', 0.0), epoch)
+                writer.add_scalar('Loss/val_param', val_comp.get('param', 0.0), epoch)
             writer.flush()
 
         # WandB logging
