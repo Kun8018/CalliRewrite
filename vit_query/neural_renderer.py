@@ -22,28 +22,28 @@ class RasterUnit(nn.Module):
         self.conv6 = nn.Conv2d(8, 4, kernel_size=3, padding=1)
 
     def forward(self, x):
+        batch_size = x.shape[0]
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = F.relu(self.fc3(x))
         x = F.relu(self.fc4(x))
 
-        x = x.view(-1, 16, 16, 16)
-        x = x.permute(0, 2, 3, 1)
+        x = x.view(batch_size, 16, 16, 16)  # (N, C, H, W) - Conv2D 期望这个格式
 
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
-        x = F.pixel_shuffle(x, upscale_factor=2)
+        x = F.pixel_shuffle(x, upscale_factor=2)  # (N, 8, 32, 32)
 
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
-        x = F.pixel_shuffle(x, upscale_factor=2)
+        x = F.pixel_shuffle(x, upscale_factor=2)  # (N, 4, 64, 64)
 
         x = F.relu(self.conv5(x))
         x = self.conv6(x)
-        x = F.pixel_shuffle(x, upscale_factor=2)
+        x = F.pixel_shuffle(x, upscale_factor=2)  # (N, 1, 128, 128)
 
         x = torch.sigmoid(x)
-        stroke_image = 1.0 - x.view(-1, self.raster_size, self.raster_size)
+        stroke_image = 1.0 - x.view(batch_size, self.raster_size, self.raster_size)
         return stroke_image
 
 
