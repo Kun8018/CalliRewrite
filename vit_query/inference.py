@@ -150,12 +150,13 @@ def infer_single_image_autoregressive(model, image_path, output_dir, img_size=22
 
     with torch.no_grad():
         target_tokens, target_global = model.encode_target(target_mask)
+        window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
         for step_idx in range(seq_len):
             canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
             cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
             step = torch.tensor([[step_idx / max(seq_len, 1)]], dtype=torch.float32, device=device)
             output, hidden = model.forward_step(
-                target_tokens, target_global, canvas, cursor, prev_stroke, step, hidden
+                target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step, hidden, window_size
             )
             stroke = output['seq'][0].detach().cpu().numpy().astype(np.float32)
             stroke[0] = 1.0 if stroke[0] > pen_threshold else 0.0

@@ -65,7 +65,7 @@ def load_model(checkpoint_path, device, arch=None, image_size=None, max_seq_len=
 
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-    print(f'Model loaded from {checkpoint_path} (epoch {checkpoint["epoch"]}, arch {arch})')
+    print(f"Model loaded from {checkpoint_path} (epoch {checkpoint['epoch']}, arch {arch})")
     return model, arch, image_size, max_seq_len
 
 
@@ -131,9 +131,9 @@ def save_inference_outputs(image_path, output_dir, strokes_data, image_size, ini
     vis_output_dir = os.path.join(output_dir, base_name)
     visualize_strokes(npz_path, original_img_path=image_path, output_dir=vis_output_dir)
 
-    print(f'Processed {image_path}: {len(strokes_data)} strokes')
-    print(f'  -> {npz_path}')
-    print(f'  -> Visualization: {vis_output_dir}')
+    print(f"Processed {image_path}: {len(strokes_data)} strokes")
+    print(f"  -> {npz_path}")
+    print(f"  -> Visualization: {vis_output_dir}")
     return strokes_data
 
 
@@ -161,13 +161,18 @@ def infer_single_image_autoregressive(model, image_path, output_dir, image_size=
 
     with torch.no_grad():
         target_tokens, target_global = model.encode_target(target_mask)
+        window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
+
         for step_idx in range(max_seq_len):
             canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
             cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
             step = torch.tensor([[step_idx / max(max_seq_len, 1)]], dtype=torch.float32, device=device)
+
+            # 新的接口：需要传 target_mask 来裁剪 patch
             output, hidden = model.forward_step(
-                target_tokens, target_global, canvas, cursor, prev_stroke, step, hidden
+                target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step, hidden, window_size
             )
+
             stroke = output['seq'][0].detach().cpu().numpy().astype(np.float32)
             stroke[0] = 1.0 if stroke[0] > pen_threshold else 0.0
             strokes_out.append(stroke.copy())
@@ -238,7 +243,7 @@ def infer_directory(model, input_dir, output_dir, arch='autoregressive', image_s
         image_paths.extend(Path(input_dir).glob(f'*{ext.upper()}'))
 
     image_paths = sorted(image_paths)
-    print(f'Found {len(image_paths)} images in {input_dir}')
+    print(f"Found {len(image_paths)} images in {input_dir}")
 
     all_strokes = []
     for img_path in image_paths:
@@ -255,14 +260,14 @@ def infer_directory(model, input_dir, output_dir, arch='autoregressive', image_s
             )
             all_strokes.append((str(img_path), strokes))
         except Exception as e:
-            print(f'Error processing {img_path}: {e}')
+            print(f"Error processing {img_path}: {e}")
     return all_strokes
 
 
 def main():
     args = parse_args()
     device = torch.device(args.device)
-    print(f'Using device: {device}')
+    print(f"Using device: {device}")
     model, arch, image_size, max_seq_len = load_model(
         args.checkpoint,
         device,
@@ -275,7 +280,7 @@ def main():
     )
 
     if os.path.isfile(args.input):
-        print(f'Processing single image: {args.input}')
+        print(f"Processing single image: {args.input}")
         infer_single_image(
             model, args.input, args.output_dir,
             arch=arch,
@@ -287,7 +292,7 @@ def main():
             device=device
         )
     elif os.path.isdir(args.input):
-        print(f'Processing directory: {args.input}')
+        print(f"Processing directory: {args.input}")
         infer_directory(
             model, args.input, args.output_dir,
             arch=arch,
@@ -299,11 +304,11 @@ def main():
             device=device
         )
     else:
-        print(f'Input not found: {args.input}')
+        print(f"Input not found: {args.input}")
         return
 
-    print(f'\nResults saved to {args.output_dir}')
+    print(f"\nResults saved to {args.output_dir}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
