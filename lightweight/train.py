@@ -317,12 +317,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, args):
                     state = initial_seq7_state(model.image_size)
                     hidden = None
                     strokes_list = []
+                    window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
                     for i in range(model.max_seq_len):
-                        canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0)
+                        canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
                         cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
                         prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
                         step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
-                        output, hidden = model.forward_step(target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden)
+                        output, hidden = model.forward_step(target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step_index, hidden, window_size)
                         stroke = output['seq'].squeeze(0).detach()
                         strokes_list.append(stroke)
                         state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
@@ -371,12 +372,13 @@ def validate(model, dataloader, criterion, device, epoch, args):
                 state = initial_seq7_state(model.image_size)
                 hidden = None
                 strokes_list = []
+                window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
                 for i in range(model.max_seq_len):
-                    canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0)
+                    canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
                     cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
                     prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
                     step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
-                    output, hidden = model.forward_step(target_tokens, target_global, canvas, cursor, prev_stroke, step_index, hidden)
+                    output, hidden = model.forward_step(target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step_index, hidden, window_size)
                     stroke = output['seq'].squeeze(0).detach()
                     strokes_list.append(stroke)
                     state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
