@@ -14,6 +14,7 @@ python train.py \
   --mode seq7 \
   --img_size 224 \
   --seq_len 100 \
+  --embed_dim 192 \
   --chunk_len 16 \
   --chunks_per_sample 4 \
   --batch_size 64 \
