@@ -20,5 +20,5 @@ python train.py \
   --epochs 100 \
   --lr 1e-4 \
   --num_workers 16 \
-  --device cuda:2 \
+  --device cuda:3 \
   --use-tensorboard

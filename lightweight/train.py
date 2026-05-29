@@ -312,22 +312,26 @@ def train_epoch(model, dataloader, optimizer, criterion, device, epoch, args):
             if args.arch == 'autoregressive':
                 # autoregressive 模型完整推理不可微，用 no_grad
                 with torch.no_grad():
-                    target_mask = 1.0 - images
-                    target_tokens, target_global = model.encode_target(target_mask)
-                    state = initial_seq7_state(model.image_size)
-                    hidden = None
-                    strokes_list = []
-                    window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
-                    for i in range(model.max_seq_len):
-                        canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-                        cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
-                        prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
-                        step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
-                        output, hidden = model.forward_step(target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step_index, hidden, window_size)
-                        stroke = output['seq'].squeeze(0).detach()
-                        strokes_list.append(stroke)
-                        state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
-                    strokes_seq7 = torch.stack(strokes_list, dim=0).unsqueeze(0)
+                    batch_strokes = []
+                    for b in range(images.shape[0]):
+                        img = images[b:b+1]
+                        target_mask = 1.0 - img
+                        target_tokens, target_global = model.encode_target(target_mask)
+                        state = initial_seq7_state(model.image_size)
+                        hidden = None
+                        strokes_list = []
+                        window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
+                        for i in range(model.max_seq_len):
+                            canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+                            cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
+                            prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
+                            step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
+                            output, hidden = model.forward_step(target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step_index, hidden, window_size)
+                            stroke = output['seq'].squeeze(0).detach()
+                            strokes_list.append(stroke)
+                            state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
+                        batch_strokes.append(torch.stack(strokes_list, dim=0))
+                    strokes_seq7 = torch.stack(batch_strokes, dim=0)
                 losses = criterion(strokes_seq7, images)
             else:
                 # oneshot 模型可以端到端训练
@@ -367,22 +371,26 @@ def validate(model, dataloader, criterion, device, epoch, args):
         if args.phase == 2:
             images = batch['image'].to(device)
             if args.arch == 'autoregressive':
-                target_mask = 1.0 - images
-                target_tokens, target_global = model.encode_target(target_mask)
-                state = initial_seq7_state(model.image_size)
-                hidden = None
-                strokes_list = []
-                window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
-                for i in range(model.max_seq_len):
-                    canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
-                    cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
-                    prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
-                    step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
-                    output, hidden = model.forward_step(target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step_index, hidden, window_size)
-                    stroke = output['seq'].squeeze(0).detach()
-                    strokes_list.append(stroke)
-                    state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
-                strokes_seq7 = torch.stack(strokes_list, dim=0).unsqueeze(0)
+                batch_strokes = []
+                for b in range(images.shape[0]):
+                    img = images[b:b+1]
+                    target_mask = 1.0 - img
+                    target_tokens, target_global = model.encode_target(target_mask)
+                    state = initial_seq7_state(model.image_size)
+                    hidden = None
+                    strokes_list = []
+                    window_size = torch.full((1, 1), model.init_window_size, dtype=torch.float32, device=device)
+                    for i in range(model.max_seq_len):
+                        canvas = torch.tensor(state['canvas'], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+                        cursor = torch.tensor(state['cursor'], dtype=torch.float32, device=device).unsqueeze(0)
+                        prev_stroke = torch.zeros(1, 7, dtype=torch.float32, device=device) if i == 0 else strokes_list[-1].unsqueeze(0)
+                        step_index = torch.tensor([[i / model.max_seq_len]], dtype=torch.float32, device=device)
+                        output, hidden = model.forward_step(target_tokens, target_global, target_mask, canvas, cursor, prev_stroke, step_index, hidden, window_size)
+                        stroke = output['seq'].squeeze(0).detach()
+                        strokes_list.append(stroke)
+                        state = apply_seq7_step(state, stroke.cpu().numpy(), model.image_size)
+                    batch_strokes.append(torch.stack(strokes_list, dim=0))
+                strokes_seq7 = torch.stack(batch_strokes, dim=0)
                 losses = criterion(strokes_seq7, images)
             else:
                 strokes_seq7 = model(images)

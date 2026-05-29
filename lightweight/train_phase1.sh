@@ -24,5 +24,5 @@ python train.py \
   --batch_size 128 \
   --epochs 50 \
   --num_workers 16 \
-  --device cuda:1 \
+  --device cuda:3 \
   --use-tensorboard
