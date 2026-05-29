@@ -1,26 +1,36 @@
 #!/bin/bash
-# ViT Query Phase 2 Finetuning (Calligraphy)
-# 使用 NeuralRenderer 进行无监督 fine-tune
+# ViT-B/16 (ImageNet pretrained) Phase 2 Finetuning — v2 可微 rollout
+set -e
 
-# Activate conda environment
 conda activate /data1/Calliwrite/kun/CalliRewrite/calli_train_env
 
 cd "$(dirname "$0")"
 
-# 使用 autoregressive 模式（带 patch encoder 的新架构）
+if [ ! -f "output_renderer/raster_unit_pretrained.pth" ]; then
+  echo "Renderer ckpt not found, run pretrain_renderer.sh first."
+  exit 1
+fi
+
+if [ ! -f "output_ar_phase1_v2/model_best.pth" ]; then
+  echo "Phase 1 ckpt not found, run train_phase1.sh first."
+  exit 1
+fi
+
 python train.py \
-  --arch autoregressive \
   --phase 2 \
   --data_dir ../seq_extract/outputs/__new_train_phase_2 \
-  --phase1_checkpoint output_ar_phase1/model_best.pth \
-  --output_dir output_ar_phase2 \
-  --mode seq7 \
-  --img_size 224 \
-  --seq_len 100 \
-  --embed_dim 192 \
-  --batch_size 32 \
+  --renderer_ckpt output_renderer/raster_unit_pretrained.pth \
+  --phase1_checkpoint output_ar_phase1_v2/model_best.pth \
+  --output_dir output_ar_phase2_v2 \
+  --image_size 224 \
+  --max_seq_len 48 \
+  --patch_size 64 \
+  --raster_size 128 \
+  --d_model 256 \
+  --hidden_dim 256 \
+  --batch_size 8 \
   --epochs 100 \
   --lr 1e-4 \
-  --num_workers 16 \
+  --num_workers 8 \
   --device cuda:0 \
-  --use-tensorboard
+  --use_tensorboard
