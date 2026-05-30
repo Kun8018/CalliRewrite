@@ -25,7 +25,8 @@ fi
 
 # 单卡 batch=8（ViT-B 显存吃得多）
 # max_items_per_category=5000 → 5 万样本 / epoch
-# cache_size=50000 → 全 cache 到内存
+# cache_size=0 → 关闭 dataset 内存 cache（worker fork 后每个 worker 会复制一份）
+# num_workers=4 → 单 rank 4 worker 已够
 $PY train.py \
   --phase 1 \
   --dataset_root ../seq_extract/datasets \
@@ -38,13 +39,13 @@ $PY train.py \
   --d_model 256 \
   --hidden_dim 256 \
   --max_items_per_category 5000 \
-  --cache_size 50000 \
+  --cache_size 0 \
   --batch_size 8 \
   --epochs 50 \
   --lr 1e-4 \
   --ss_prob_start 1.0 \
   --ss_prob_end 0.0 \
-  --num_workers 8 \
+  --num_workers 4 \
   --device cuda:0 \
   --use_tensorboard
 

@@ -24,7 +24,8 @@ export PYTHONNOUSERSITE=1
 
 # 4 卡 DDP，单卡 batch=12 → 全局 batch=48
 # max_items_per_category=5000 → 共 5 万样本（10 类）/ epoch
-# cache_size=50000 → 全 cache 到内存
+# cache_size=0 → 关闭 dataset 内存 cache（避免 4 rank × 8 worker × 12GB = OOM）
+# num_workers=2 → 4 rank × 2 = 8 worker 已够 GPU 不饿，且内存占用可控
 $PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --phase 1 \
   --dataset_root ../seq_extract/datasets \
@@ -37,12 +38,12 @@ $PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --d_model 256 \
   --hidden_dim 256 \
   --max_items_per_category 5000 \
-  --cache_size 50000 \
+  --cache_size 0 \
   --batch_size 12 \
   --epochs 50 \
   --lr 1e-4 \
   --ss_prob_start 1.0 \
   --ss_prob_end 0.0 \
-  --num_workers 8 \
+  --num_workers 2 \
   --use_tensorboard
 
