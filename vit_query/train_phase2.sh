@@ -1,5 +1,5 @@
 #!/bin/bash
-# ViT-B/16 (ImageNet pretrained) Phase 2 Finetuning — v2 可微 rollout
+# ViT-B/16 Phase 2 Finetuning — v2 可微 rollout，单卡
 set -e
 
 conda activate /data1/Calliwrite/kun/CalliRewrite/calli_train_env

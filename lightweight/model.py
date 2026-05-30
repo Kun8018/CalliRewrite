@@ -253,6 +253,10 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
     # --------------------------------------------------------------------- #
     # rollout
     # --------------------------------------------------------------------- #
+    def forward(self, *args, **kwargs):
+        """nn.Module.forward 调 rollout，使 DDP 能拦截到 gradient reduce。"""
+        return self.rollout(*args, **kwargs)
+
     def rollout(self,
                 target_image: torch.Tensor,
                 neural_renderer,

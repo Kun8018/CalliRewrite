@@ -33,5 +33,5 @@ python train.py \
   --epochs 100 \
   --lr 1e-4 \
   --num_workers 8 \
-  --device cuda:3 \
+  --device cuda:2 \
   --use_tensorboard

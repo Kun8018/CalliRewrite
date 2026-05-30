@@ -26,10 +26,15 @@ QUICKDRAW_CATEGORIES = [
 
 class QuickDrawCleanDataset(Dataset):
     """读取 seq_extract/datasets/QuickDraw-clean/{train,test}/*.npz 中的 stroke3。
-    Phase1 监督数据来源。"""
+    Phase1 监督数据来源。
+
+    每个 __getitem__ 要 PIL 渲染图像 + stroke3 → seq7 转换，比较吃 CPU；
+    打开 cache_size > 0 后会把已处理的样本存内存（每个样本 ~ 256x256 灰度 + (T,7) ≈ 100KB），
+    1 万样本约 1GB。dataloader num_workers 共用进程内 cache。"""
 
     def __init__(self, dataset_root, split='train', image_size=256, max_seq_len=100,
-                 categories=None, max_items_per_category=None):
+                 categories=None, max_items_per_category=None,
+                 cache_size=0):
         self.image_size = image_size
         self.max_seq_len = max_seq_len
         self.samples = []
@@ -49,13 +54,16 @@ class QuickDrawCleanDataset(Dataset):
 
         print(f'Loaded {len(self.samples)} QuickDraw-clean samples ({split})')
 
+        self.cache_size = cache_size
+        self._cache = {}  # idx -> processed dict
+
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
+    def _process(self, idx):
         stroke3 = np.asarray(self.samples[idx], dtype=np.float32)
-        target_image = render_stroke3_tensor(stroke3, self.image_size)        # (1, H, W) ∈ [0,1], 1=BG
-        target_stroke = 1.0 - target_image.squeeze(0)                          # (H, W), 1=stroke
+        target_image = render_stroke3_tensor(stroke3, self.image_size)
+        target_stroke = 1.0 - target_image.squeeze(0)
         strokes = quickdraw_stroke3_to_7d(stroke3, self.image_size)
         gt, mask, seq_len = pad_strokes(strokes, self.max_seq_len)
         return {
@@ -65,6 +73,14 @@ class QuickDrawCleanDataset(Dataset):
             'gt_mask': torch.from_numpy(mask),
             'seq_len': seq_len,
         }
+
+    def __getitem__(self, idx):
+        if self.cache_size > 0 and idx in self._cache:
+            return self._cache[idx]
+        item = self._process(idx)
+        if self.cache_size > 0 and len(self._cache) < self.cache_size:
+            self._cache[idx] = item
+        return item
 
 
 class ImageOnlyDataset(Dataset):

@@ -1,12 +1,16 @@
 #!/bin/bash
 # ViT-B/16 (ImageNet pretrained) Phase 1 Training — v2 可微 rollout
+# 需要预先运行 pretrain_renderer.sh
+# 单卡训练；若要多卡 DDP，把第一行 python 改成:
+#   torchrun --standalone --nproc_per_node=4 train.py ...
+# 同时去掉 --device 参数。
 set -e
 
 conda activate /data1/Calliwrite/kun/CalliRewrite/calli_train_env
 
 cd "$(dirname "$0")"
 
-if [ ! -d "datasets/QuickDraw-clean" ] && [ ! -d "../seq_extract/datasets/QuickDraw-clean" ]; then
+if [ ! -d "../seq_extract/datasets/QuickDraw-clean" ]; then
   echo "QuickDraw-clean not found, please prepare datasets first."
   exit 1
 fi
@@ -16,6 +20,9 @@ if [ ! -f "output_renderer/raster_unit_pretrained.pth" ]; then
   exit 1
 fi
 
+# 单卡 batch=8（ViT-B 显存吃得多）
+# max_items_per_category=5000 → 5 万样本 / epoch
+# cache_size=50000 → 全 cache 到内存
 python train.py \
   --phase 1 \
   --dataset_root ../seq_extract/datasets \
@@ -27,6 +34,8 @@ python train.py \
   --raster_size 128 \
   --d_model 256 \
   --hidden_dim 256 \
+  --max_items_per_category 5000 \
+  --cache_size 50000 \
   --batch_size 8 \
   --epochs 50 \
   --lr 1e-4 \

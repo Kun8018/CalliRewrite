@@ -19,13 +19,49 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import random_split, DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import random_split, DataLoader, DistributedSampler
 from tqdm import tqdm
 
 from model import ViTAutoregressiveExtractor7D, count_parameters
 from neural_renderer import NeuralRasterizorStep
 from dataset import QuickDrawCleanDataset, ImageOnlyDataset
 from losses import CombinedRolloutLoss
+
+
+# --------------------------------------------------------------------- #
+# DDP helpers
+# --------------------------------------------------------------------- #
+
+def setup_ddp():
+    """初始化 DDP 环境（若用 torchrun 启动）。
+    返回 (local_rank, world_size, is_main)。
+    单卡时返回 (0, 1, True)。"""
+    if 'LOCAL_RANK' in os.environ:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl')
+        world_size = dist.get_world_size()
+        is_main = local_rank == 0
+        if is_main:
+            print(f'[DDP] world_size={world_size}, local_rank={local_rank}')
+        return local_rank, world_size, is_main
+    return 0, 1, True
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def all_reduce_mean(value: float, world_size: int) -> float:
+    """跨 rank 平均一个标量。"""
+    if world_size <= 1:
+        return value
+    t = torch.tensor([value], dtype=torch.float64, device='cuda')
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return (t / world_size).item()
 
 
 # --------------------------------------------------------------------- #
@@ -44,8 +80,6 @@ def parse_args():
     p.add_argument('--freeze_renderer', action='store_true', default=True)
     p.add_argument('--no_freeze_renderer', dest='freeze_renderer', action='store_false')
     p.add_argument('--output_dir', type=str, default='./output_vit_v2')
-    p.add_argument('--no_pretrained_vit', action='store_true',
-                   help='不加载 torchvision ViT 预训练权重（默认加载）')
 
     p.add_argument('--image_size', type=int, default=224)
     p.add_argument('--max_seq_len', type=int, default=48)  # 原版 phase1/2 都是 48
@@ -54,6 +88,8 @@ def parse_args():
     p.add_argument('--d_model', type=int, default=256)
     p.add_argument('--hidden_dim', type=int, default=256)
     p.add_argument('--num_heads', type=int, default=None)
+    p.add_argument('--no_pretrained_vit', action='store_true',
+                   help='不加载 torchvision ViT ImageNet 预训练权重（默认加载）')
 
     p.add_argument('--batch_size', type=int, default=12)
     p.add_argument('--epochs', type=int, default=100)
@@ -62,7 +98,10 @@ def parse_args():
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--num_workers', type=int, default=4)
     p.add_argument('--val_split', type=float, default=0.1)
-    p.add_argument('--max_items_per_category', type=int, default=None)
+    p.add_argument('--max_items_per_category', type=int, default=5000,
+                   help='Phase1 每个 QuickDraw 类别取多少样本（原版 ~5万/类 → 这里 5k 已够）')
+    p.add_argument('--cache_size', type=int, default=50000,
+                   help='dataset 内存 cache 多少处理过的样本，0 关闭')
 
     # scheduled sampling
     p.add_argument('--ss_prob_start', type=float, default=1.0,
@@ -136,11 +175,13 @@ def build_dataset(args):
         train_ds = QuickDrawCleanDataset(
             dataset_root=args.dataset_root, split='train',
             image_size=args.image_size, max_seq_len=args.max_seq_len,
-            max_items_per_category=args.max_items_per_category)
+            max_items_per_category=args.max_items_per_category,
+            cache_size=args.cache_size)
         val_ds = QuickDrawCleanDataset(
             dataset_root=args.dataset_root, split='test',
             image_size=args.image_size, max_seq_len=args.max_seq_len,
-            max_items_per_category=args.max_items_per_category)
+            max_items_per_category=max(500, args.max_items_per_category // 10),
+            cache_size=args.cache_size // 5 if args.cache_size > 0 else 0)
         return train_ds, val_ds
 
     # phase 2
@@ -217,16 +258,18 @@ def schedule_ss_prob(args, epoch):
 # --------------------------------------------------------------------- #
 
 def run_step(model, renderer, loss_fn, batch, device, args, ss_prob):
-    target_image = batch['target_image'].to(device)            # (N, 1, H, W) 1=BG
-    target_stroke_img = batch['target_stroke_img'].to(device)  # (N, H, W) 1=stroke
+    target_image = batch['target_image'].to(device, non_blocking=True)            # (N, 1, H, W) 1=BG
+    target_stroke_img = batch['target_stroke_img'].to(device, non_blocking=True)  # (N, H, W) 1=stroke
 
     gt_strokes = batch.get('gt_strokes')
     gt_mask = batch.get('gt_mask')
     if gt_strokes is not None:
-        gt_strokes = gt_strokes.to(device)
-        gt_mask = gt_mask.to(device)
+        gt_strokes = gt_strokes.to(device, non_blocking=True)
+        gt_mask = gt_mask.to(device, non_blocking=True)
 
-    rollout = model.rollout(
+    # DDP 包装后 model(*) 会拦截 forward 做 gradient reduce；
+    # forward 内部就是 rollout（见 model.py）
+    rollout = model(
         target_image, renderer,
         seq_len=args.max_seq_len,
         gt_strokes=gt_strokes,
@@ -245,7 +288,9 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
     ss_prob = schedule_ss_prob(args, epoch)
     total = 0.0
     comp_acc = {}
-    pbar = tqdm(loader, desc=f'Epoch {epoch} [Train] ss={ss_prob:.2f}')
+    is_main = (getattr(args, 'local_rank', 0) == 0)
+    pbar = tqdm(loader, desc=f'Epoch {epoch} [Train] ss={ss_prob:.2f}',
+                disable=not is_main)
     for batch in pbar:
         optimizer.zero_grad()
         losses, _ = run_step(model, renderer, loss_fn, batch, device, args, ss_prob)
@@ -259,7 +304,8 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
             if k == 'total':
                 continue
             comp_acc[k] = comp_acc.get(k, 0.0) + float(v)
-        pbar.set_postfix(loss=loss.item())
+        if is_main:
+            pbar.set_postfix(loss=loss.item())
     n = max(len(loader), 1)
     comp_acc = {k: v / n for k, v in comp_acc.items()}
     return total / n, comp_acc, ss_prob
@@ -270,7 +316,8 @@ def validate(model, renderer, loss_fn, loader, device, epoch, args):
     model.eval()
     total = 0.0
     comp_acc = {}
-    pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]')
+    is_main = (getattr(args, 'local_rank', 0) == 0)
+    pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]', disable=not is_main)
     for batch in pbar:
         losses, _ = run_step(model, renderer, loss_fn, batch, device, args, 0.0)
         total += losses['total'].item()
@@ -278,16 +325,19 @@ def validate(model, renderer, loss_fn, loader, device, epoch, args):
             if k == 'total':
                 continue
             comp_acc[k] = comp_acc.get(k, 0.0) + float(v)
-        pbar.set_postfix(loss=losses['total'].item())
+        if is_main:
+            pbar.set_postfix(loss=losses['total'].item())
     n = max(len(loader), 1)
     comp_acc = {k: v / n for k, v in comp_acc.items()}
     return total / n, comp_acc
 
 
 def save_checkpoint(model, optim, epoch, loss, save_path, args):
+    """save model.module.state_dict() if DDP, else model.state_dict()."""
+    sd = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
     torch.save({
         'epoch': epoch,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': sd,
         'optimizer_state_dict': optim.state_dict(),
         'loss': loss,
         'phase': args.phase,
@@ -303,93 +353,148 @@ def save_checkpoint(model, optim, epoch, loss, save_path, args):
 def main():
     args = parse_args()
     setdefault_weights_by_phase(args)
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    tee = Tee(os.path.join(args.output_dir, 'training.log'))
-    sys.stdout = tee
-    sys.stderr = tee
-    print(f'Args: {vars(args)}')
+    # 1) DDP 初始化（torchrun 自动设环境变量；单进程时返回单卡 stub）
+    local_rank, world_size, is_main = setup_ddp()
+    args.world_size = world_size
+    args.local_rank = local_rank
 
-    device = torch.device(args.device)
-    print(f'Device: {device}, phase={args.phase}')
+    if world_size > 1:
+        device = torch.device(f'cuda:{local_rank}')
+    elif torch.cuda.is_available():
+        # 单卡：尊重用户 --device cuda:N
+        device = torch.device(args.device)
+        if args.device.startswith('cuda'):
+            idx = int(args.device.split(':')[-1]) if ':' in args.device else 0
+            torch.cuda.set_device(idx)
+    else:
+        device = torch.device('cpu')
 
-    csv_path = os.path.join(args.output_dir, 'train_log.csv')
-    csv_file = open(csv_path, 'w', buffering=1)
-    csv_writer = csv.writer(csv_file)
-    header = ['epoch', 'ss_prob', 'train_loss', 'val_loss', 'best_val_loss']
-    # 组件列稍后第一次拿到才知道，写在第二行起
-    csv_writer.writerow(header)
+    if is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
+        tee = Tee(os.path.join(args.output_dir, 'training.log'))
+        sys.stdout = tee
+        sys.stderr = tee
+        print(f'Args: {vars(args)}')
+        print(f'Device: {device}, phase={args.phase}, world_size={world_size}')
 
+    # CSV / TB 只在 rank 0
+    csv_writer = None
+    csv_file = None
     writer = None
-    if args.use_tensorboard:
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            tb_dir = os.path.join(args.output_dir, 'tensorboard')
-            os.makedirs(tb_dir, exist_ok=True)
-            writer = SummaryWriter(tb_dir)
-            print(f'TensorBoard: {tb_dir}')
-        except ImportError:
-            print('TensorBoard not available')
+    if is_main:
+        csv_path = os.path.join(args.output_dir, 'train_log.csv')
+        csv_file = open(csv_path, 'w', buffering=1)
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(['epoch', 'ss_prob', 'train_loss', 'val_loss', 'best_val_loss'])
+        if args.use_tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                tb_dir = os.path.join(args.output_dir, 'tensorboard')
+                os.makedirs(tb_dir, exist_ok=True)
+                writer = SummaryWriter(tb_dir)
+                print(f'TensorBoard: {tb_dir}')
+            except ImportError:
+                print('TensorBoard not available')
 
+    # 2) 数据
     train_ds, val_ds = build_dataset(args)
-    print(f'Train {len(train_ds)} / Val {len(val_ds)}')
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+    if is_main:
+        print(f'Train {len(train_ds)} / Val {len(val_ds)}')
 
+    if world_size > 1:
+        train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
+        val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False)
+    else:
+        train_sampler = None
+        val_sampler = None
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size,
+        shuffle=False, sampler=val_sampler,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    # 3) 模型 + DDP 包装
     model, renderer, loss_fn = build_model_renderer_loss(args, device)
     if args.phase == 2 and args.phase1_checkpoint:
         load_phase1_checkpoint(model, args.phase1_checkpoint, device)
-    print(f'Model: {count_parameters(model)}')
+    if is_main:
+        print(f'Model: {count_parameters(model)}')
 
-    optim_ = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if world_size > 1:
+        # find_unused_parameters=True 因为 scheduled_sampling 等可能某些参数没走梯度
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
+
+    optim_ = optim.AdamW(model.parameters(), lr=args.lr,
+                          weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optim_, T_max=args.epochs)
     best = float('inf')
 
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         train_loss, train_comp, ss_prob = train_epoch(
             model, renderer, loss_fn, train_loader, optim_, device, epoch, args)
         val_loss, val_comp = validate(
             model, renderer, loss_fn, val_loader, device, epoch, args)
         scheduler.step()
 
-        print(f'Epoch {epoch}/{args.epochs}  ss={ss_prob:.2f}  '
-              f'train={train_loss:.4f}  val={val_loss:.4f}  best={best:.4f}')
-        print('  train_comp:', {k: round(v, 4) for k, v in train_comp.items()})
-        print('  val_comp:',   {k: round(v, 4) for k, v in val_comp.items()})
+        # 跨 rank 平均 loss 显示
+        train_loss = all_reduce_mean(train_loss, world_size)
+        val_loss = all_reduce_mean(val_loss, world_size)
+        train_comp = {k: all_reduce_mean(v, world_size) for k, v in train_comp.items()}
+        val_comp = {k: all_reduce_mean(v, world_size) for k, v in val_comp.items()}
 
-        csv_writer.writerow([epoch, ss_prob, train_loss, val_loss, best,
-                             *[round(v, 6) for v in train_comp.values()],
-                             *[round(v, 6) for v in val_comp.values()]])
+        if is_main:
+            print(f'Epoch {epoch}/{args.epochs}  ss={ss_prob:.2f}  '
+                  f'train={train_loss:.4f}  val={val_loss:.4f}  best={best:.4f}')
+            print('  train_comp:', {k: round(v, 4) for k, v in train_comp.items()})
+            print('  val_comp:',   {k: round(v, 4) for k, v in val_comp.items()})
+
+            csv_writer.writerow([epoch, ss_prob, train_loss, val_loss, best,
+                                 *[round(v, 6) for v in train_comp.values()],
+                                 *[round(v, 6) for v in val_comp.values()]])
+            if writer:
+                writer.add_scalar('loss/train', train_loss, epoch)
+                writer.add_scalar('loss/val', val_loss, epoch)
+                writer.add_scalar('ss_prob', ss_prob, epoch)
+                for k, v in train_comp.items():
+                    writer.add_scalar(f'train/{k}', v, epoch)
+                for k, v in val_comp.items():
+                    writer.add_scalar(f'val/{k}', v, epoch)
+                writer.flush()
+
+            if val_loss < best:
+                best = val_loss
+                save_checkpoint(model, optim_, epoch, val_loss,
+                                os.path.join(args.output_dir, 'model_best.pth'), args)
+            if epoch % args.save_every == 0:
+                save_checkpoint(model, optim_, epoch, val_loss,
+                                os.path.join(args.output_dir, f'model_epoch_{epoch}.pth'), args)
+
+    if is_main:
+        save_checkpoint(model, optim_, args.epochs, val_loss,
+                        os.path.join(args.output_dir, 'model_final.pth'), args)
+        print(f'\nBest val loss: {best:.4f}')
+        csv_file.close()
         if writer:
-            writer.add_scalar('loss/train', train_loss, epoch)
-            writer.add_scalar('loss/val', val_loss, epoch)
-            writer.add_scalar('ss_prob', ss_prob, epoch)
-            for k, v in train_comp.items():
-                writer.add_scalar(f'train/{k}', v, epoch)
-            for k, v in val_comp.items():
-                writer.add_scalar(f'val/{k}', v, epoch)
-            writer.flush()
+            writer.close()
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
+        tee.close()
 
-        if val_loss < best:
-            best = val_loss
-            save_checkpoint(model, optim_, epoch, val_loss,
-                            os.path.join(args.output_dir, 'model_best.pth'), args)
-        if epoch % args.save_every == 0:
-            save_checkpoint(model, optim_, epoch, val_loss,
-                            os.path.join(args.output_dir, f'model_epoch_{epoch}.pth'), args)
-
-    save_checkpoint(model, optim_, args.epochs, val_loss,
-                    os.path.join(args.output_dir, 'model_final.pth'), args)
-    print(f'\nBest val loss: {best:.4f}')
-
-    csv_file.close()
-    if writer:
-        writer.close()
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
-    tee.close()
+    cleanup_ddp()
 
 
 if __name__ == '__main__':
