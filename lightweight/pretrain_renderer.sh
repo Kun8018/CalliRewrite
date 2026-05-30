@@ -4,13 +4,16 @@
 # 输出: output_renderer/raster_unit_pretrained.pth
 set -e
 
-conda activate /data1/Calliwrite/kun/CalliRewrite/calli_train_env
+# 显式指定 conda env 的 python，避免被 /home/<user>/.local 里的旧 PyTorch/numpy 抢走
+CONDA_ENV=/data1/Calliwrite/kun/CalliRewrite/calli_train_env
+PY=$CONDA_ENV/bin/python
+export PYTHONNOUSERSITE=1
 
 cd "$(dirname "$0")"
 
 mkdir -p output_renderer
 
-python pretrain_renderer.py \
+$PY pretrain_renderer.py \
   --output_path output_renderer/raster_unit_pretrained.pth \
   --steps 100000 \
   --batch_size 64 \
@@ -19,3 +22,4 @@ python pretrain_renderer.py \
   --log_every 200 \
   --save_every 10000 \
   --device cuda:0
+

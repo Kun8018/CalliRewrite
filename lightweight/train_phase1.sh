@@ -3,7 +3,9 @@
 # 需要预先运行 pretrain_renderer.sh 得到 raster_unit_pretrained.pth
 set -e
 
-conda activate /data1/Calliwrite/kun/CalliRewrite/calli_train_env
+# 显式指定 conda env 的 python，避免被 /home/<user>/.local 里的旧 PyTorch/numpy 抢走
+CONDA_ENV=/data1/Calliwrite/kun/CalliRewrite/calli_train_env
+PY=$CONDA_ENV/bin/python
 
 cd "$(dirname "$0")"
 
@@ -17,10 +19,13 @@ if [ ! -f "output_renderer/raster_unit_pretrained.pth" ]; then
   exit 1
 fi
 
+# 屏蔽用户级 site-packages（避免被 /home/<user>/.local 污染）
+export PYTHONNOUSERSITE=1
+
 # 4 卡 DDP，单卡 batch=12 → 全局 batch=48
 # max_items_per_category=5000 → 共 5 万样本（10 类）/ epoch
 # cache_size=50000 → 全 cache 到内存
-torchrun --standalone --nproc_per_node=4 train.py \
+$PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --phase 1 \
   --dataset_root ../seq_extract/datasets \
   --renderer_ckpt output_renderer/raster_unit_pretrained.pth \
@@ -40,3 +45,4 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --ss_prob_end 0.0 \
   --num_workers 8 \
   --use_tensorboard
+

@@ -3,7 +3,10 @@
 # 需要：raster_unit_pretrained.pth + phase1 best ckpt
 set -e
 
-conda activate /data1/Calliwrite/kun/CalliRewrite/calli_train_env
+# 显式指定 conda env 的 python，避免被 /home/<user>/.local 里的旧 PyTorch/numpy 抢走
+CONDA_ENV=/data1/Calliwrite/kun/CalliRewrite/calli_train_env
+PY=$CONDA_ENV/bin/python
+export PYTHONNOUSERSITE=1
 
 cd "$(dirname "$0")"
 
@@ -17,7 +20,7 @@ if [ ! -f "output_ar_phase1_v2/model_best.pth" ]; then
   exit 1
 fi
 
-python train.py \
+$PY train.py \
   --phase 2 \
   --data_dir ../seq_extract/outputs/__new_train_phase_2 \
   --renderer_ckpt output_renderer/raster_unit_pretrained.pth \
@@ -35,3 +38,4 @@ python train.py \
   --num_workers 8 \
   --device cuda:2 \
   --use_tensorboard
+
