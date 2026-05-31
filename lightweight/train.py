@@ -101,10 +101,18 @@ def parse_args():
     p.add_argument('--cache_size', type=int, default=50000,
                    help='dataset 内存 cache 多少处理过的样本，0 关闭')
 
-    # scheduled sampling
-    p.add_argument('--ss_prob_start', type=float, default=1.0,
-                   help='phase1 起始 teacher forcing 概率（1=纯 TF, 0=纯 free run）')
-    p.add_argument('--ss_prob_end', type=float, default=0.0)
+    # scheduled sampling (已废弃，保留参数以免老 shell 报错)
+    p.add_argument('--ss_prob_start', type=float, default=0.0,
+                   help='[已废弃] scheduled sampling 起始概率')
+    p.add_argument('--ss_prob_end', type=float, default=0.0,
+                   help='[已废弃] scheduled sampling 终点概率')
+
+    # 随机初始 cursor（关键：迫使模型必须看 target image）
+    p.add_argument('--random_init_cursor', action='store_true', default=True,
+                   help='训练时每张图 cursor 随机起点（防止固化路径）')
+    p.add_argument('--no_random_init_cursor', dest='random_init_cursor', action='store_false')
+    p.add_argument('--init_cursor_low', type=float, default=0.2)
+    p.add_argument('--init_cursor_high', type=float, default=0.8)
 
     # loss weights（对齐 hyper_parameters.py phase 1/2 默认）
     p.add_argument('--w_raster', type=float, default=1.0)
@@ -130,7 +138,10 @@ def setdefault_weights_by_phase(args):
     if args.phase == 1:
         if args.w_smoothness is None: args.w_smoothness = 0.0
         if args.w_angle is None:      args.w_angle = 0.0
-        if args.w_supervised is None: args.w_supervised = 1.0
+        # 监督权重降到 0.1：random_init_cursor 之后 GT cursor 路径不再与模型一致，
+        # 强监督 coord/param 会拖累训练。只保留弱信号约束 pen state 节奏。
+        # raster_l1 + perceptual 是主信号。
+        if args.w_supervised is None: args.w_supervised = 0.1
     else:
         if args.w_smoothness is None: args.w_smoothness = 0.5
         if args.w_angle is None:      args.w_angle = 1.0
@@ -254,7 +265,7 @@ def schedule_ss_prob(args, epoch):
 # step
 # --------------------------------------------------------------------- #
 
-def run_step(model, renderer, loss_fn, batch, device, args, ss_prob):
+def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: bool):
     target_image = batch['target_image'].to(device, non_blocking=True)            # (N, 1, H, W) 1=BG
     target_stroke_img = batch['target_stroke_img'].to(device, non_blocking=True)  # (N, H, W) 1=stroke
 
@@ -264,6 +275,15 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob):
         gt_strokes = gt_strokes.to(device, non_blocking=True)
         gt_mask = gt_mask.to(device, non_blocking=True)
 
+    # 训练时随机初始 cursor（防止模型固化"从 (0.5, 0.5) 起手"的 trivial 路径）
+    # 验证/推理时仍用默认中心起点，行为可对比可重现
+    if training and args.random_init_cursor:
+        N = target_image.shape[0]
+        lo, hi = args.init_cursor_low, args.init_cursor_high
+        init_cursor = torch.rand(N, 2, device=device) * (hi - lo) + lo
+    else:
+        init_cursor = None
+
     # DDP 包装后 model(*) 会拦截 forward 做 gradient reduce；
     # forward 内部就是 rollout（见 model.py）
     rollout = model(
@@ -271,6 +291,7 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob):
         seq_len=args.max_seq_len,
         gt_strokes=gt_strokes,
         scheduled_sampling_prob=ss_prob,
+        init_cursor=init_cursor,
     )
 
     losses = loss_fn(rollout, target_stroke_img, args.image_size,
@@ -290,7 +311,7 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
                 disable=not is_main)
     for batch in pbar:
         optimizer.zero_grad()
-        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, ss_prob)
+        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training=True)
         loss = losses['total']
         loss.backward()
         if args.grad_clip > 0:
@@ -316,7 +337,7 @@ def validate(model, renderer, loss_fn, loader, device, epoch, args):
     is_main = (getattr(args, 'local_rank', 0) == 0)
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]', disable=not is_main)
     for batch in pbar:
-        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, 0.0)
+        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, 0.0, training=False)
         total += losses['total'].item()
         for k, v in losses.items():
             if k == 'total':

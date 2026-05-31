@@ -187,7 +187,8 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
 
         # 标量 / 短向量 embedding
         self.cursor_mlp = nn.Sequential(nn.Linear(2, d_model), nn.GELU(), nn.LayerNorm(d_model))
-        self.prev_stroke_mlp = nn.Sequential(nn.Linear(7, d_model), nn.GELU(), nn.LayerNorm(d_model))
+        # 注意：故意不要 prev_stroke MLP——它在 closed-loop 训练里会成为 cheat sheet，
+        #      让模型学到"下一步 ≈ 函数(上一步)"而忽略 target image。
         self.window_mlp = nn.Sequential(nn.Linear(2, d_model), nn.GELU(), nn.LayerNorm(d_model))
         self.step_mlp = nn.Sequential(nn.Linear(1, d_model), nn.GELU(), nn.LayerNorm(d_model))
 
@@ -196,7 +197,7 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             d_model, num_heads=num_heads, batch_first=True)
 
         self.gru_input_proj = nn.Sequential(
-            nn.Linear(d_model * 6, hidden_dim),
+            nn.Linear(d_model * 5, hidden_dim),  # patch_attn + target_global + canvas + cursor + (win+step)
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
         )
@@ -234,10 +235,8 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
         # canvas 全局
         canvas_feat = self.canvas_encoder(state.canvas)
 
-        # 标量 embeddings
+        # 标量 embeddings (不再用 prev_stroke——见 __init__ 中的注释)
         cursor_feat = self.cursor_mlp(state.cursor)
-        prev_stroke_feat = self.prev_stroke_mlp(state.prev_stroke)
-        # window 双归一化：top=window/H, bottom=window/min_window
         win_top = curr_window / float(state.img_size)
         win_bot = curr_window / MIN_WINDOW_SIZE
         window_feat = self.window_mlp(torch.cat([win_top, win_bot], dim=-1))
@@ -245,7 +244,7 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
 
         gru_input = self.gru_input_proj(torch.cat([
             patch_attn, target_global, canvas_feat, cursor_feat,
-            prev_stroke_feat + window_feat, step_feat
+            window_feat + step_feat
         ], dim=-1))
 
         return self.gru(gru_input, hidden)
@@ -261,11 +260,12 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
                 target_image: torch.Tensor,
                 neural_renderer,
                 seq_len: int = None,
-                gt_strokes: torch.Tensor = None,
-                scheduled_sampling_prob: float = 0.0,
+                gt_strokes: torch.Tensor = None,  # noqa: ARG002 — 保留签名兼容旧 train.py 调用
+                scheduled_sampling_prob: float = 0.0,  # noqa: ARG002 — 同上，scheduled sampling 已废弃
                 detach_canvas_for_encoder: bool = True,
                 init_state: RolloutState = None,
-                init_hidden: torch.Tensor = None) -> dict:
+                init_hidden: torch.Tensor = None,
+                init_cursor: torch.Tensor = None) -> dict:
         """从 target_image 出发，模型自闭环 unroll 一段序列。
 
         Args:
@@ -304,6 +304,10 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             state = init_rollout_state(N, self.image_size, device, dtype)
             state.prev_window_size = torch.full_like(state.prev_window_size,
                                                      self.init_window_size)
+            if init_cursor is not None:
+                # 训练时强制提供随机起点，迫使模型必须看 target 才能决定下一步。
+                # init_cursor: (N, 2) ∈ [0, 1)，由调用方采样。
+                state.cursor = init_cursor.to(device=device, dtype=dtype)
         else:
             state = init_state
 
@@ -361,11 +365,10 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             cursor_list.append(state.cursor)
             window_list.append(info['curr_window_size'])
 
-            # Scheduled sampling：以 prob 用 GT 笔画覆盖 prev_stroke（供下一步特征用）
-            if gt_strokes is not None and scheduled_sampling_prob > 0 and t < seq_len - 1:
-                # 完整覆盖也覆盖 cursor/canvas 太复杂；这里只覆盖 prev_stroke 特征
-                if torch.rand(1, device=device).item() < scheduled_sampling_prob:
-                    state.prev_stroke = gt_strokes[:, t].detach()
+            # 不做 scheduled sampling: 训练时让模型用自己的 prediction 推进 cursor/canvas，
+            # 这样 phase1 才是真正的 closed-loop 训练（与 inference 一致）。
+            # 否则模型会学会"prev_stroke ≈ GT 上一步 → 复制 + 微调"的 cheat，
+            # 而忽略 target image。
 
         return {
             'seq': torch.stack(seqs, dim=1),
