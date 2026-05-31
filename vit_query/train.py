@@ -97,6 +97,9 @@ def parse_args():
     p.add_argument('--weight_decay', type=float, default=1e-4)
     p.add_argument('--grad_clip', type=float, default=1.0)
     p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--amp', action='store_true', default=False,
+                   help='bf16 混合精度训练（5090 推荐开启，提速并省显存）')
+    p.add_argument('--no_amp', dest='amp', action='store_false')
     p.add_argument('--val_split', type=float, default=0.1)
     p.add_argument('--max_items_per_category', type=int, default=5000,
                    help='Phase1 每个 QuickDraw 类别取多少样本（原版 ~5万/类 → 这里 5k 已够）')
@@ -320,18 +323,19 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: b
     else:
         init_cursor = None
 
-    # DDP 包装后 model(*) 会拦截 forward 做 gradient reduce；
-    # forward 内部就是 rollout（见 model.py）
-    rollout = model(
-        target_image, renderer,
-        seq_len=args.max_seq_len,
-        gt_strokes=gt_strokes,
-        scheduled_sampling_prob=ss_prob,
-        init_cursor=init_cursor,
-    )
-
-    losses = loss_fn(rollout, target_stroke_img, args.image_size,
-                     gt_strokes=gt_strokes, gt_mask=gt_mask)
+    use_amp = args.amp and device.type == 'cuda'
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+        # DDP 包装后 model(*) 会拦截 forward 做 gradient reduce；
+        # forward 内部就是 rollout（见 model.py）
+        rollout = model(
+            target_image, renderer,
+            seq_len=args.max_seq_len,
+            gt_strokes=gt_strokes,
+            scheduled_sampling_prob=ss_prob,
+            init_cursor=init_cursor,
+        )
+        losses = loss_fn(rollout, target_stroke_img, args.image_size,
+                         gt_strokes=gt_strokes, gt_mask=gt_mask)
     return losses, rollout
 
 
@@ -424,13 +428,17 @@ def main():
     else:
         device = torch.device('cpu')
 
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
+
     if is_main:
         os.makedirs(args.output_dir, exist_ok=True)
         tee = Tee(os.path.join(args.output_dir, 'training.log'))
         sys.stdout = tee
         sys.stderr = tee
         print(f'Args: {vars(args)}')
-        print(f'Device: {device}, phase={args.phase}, world_size={world_size}')
+        print(f'Device: {device}, phase={args.phase}, world_size={world_size}, '
+              f'amp={"bf16" if args.amp and device.type == "cuda" else "off"}')
 
     # CSV / TB 只在 rank 0
     csv_writer = None

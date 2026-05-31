@@ -23,10 +23,10 @@ if [ ! -f "output_renderer/raster_unit_pretrained.pth" ]; then
   exit 1
 fi
 
-# 单卡 batch=8（ViT-B 显存吃得多）
+# 5090 32G 单卡：batch=24 + bf16 AMP
 # max_items_per_category=5000 → 5 万样本 / epoch
-# cache_size=0 → 关闭 dataset 内存 cache（worker fork 后每个 worker 会复制一份）
-# num_workers=4 → 单 rank 4 worker 已够
+# cache_size=0 → 关闭 cache（worker fork 会复制 cache，易 OOM）
+# num_workers=8 → 配合 cache=0，减轻 CPU 数据瓶颈
 $PY train.py \
   --phase 1 \
   --dataset_root ../seq_extract/datasets \
@@ -40,10 +40,11 @@ $PY train.py \
   --hidden_dim 256 \
   --max_items_per_category 5000 \
   --cache_size 0 \
-  --batch_size 8 \
+  --batch_size 24 \
   --epochs 50 \
-  --lr 1e-4 \
-  --num_workers 4 \
+  --lr 2e-4 \
+  --num_workers 8 \
+  --amp \
   --device cuda:0 \
   --use_tensorboard
 
