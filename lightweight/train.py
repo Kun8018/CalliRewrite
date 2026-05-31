@@ -365,6 +365,7 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
     ss_prob = schedule_ss_prob(args, epoch)
     total = 0.0
     comp_acc = {}
+    num_updates = 0
     is_main = (getattr(args, 'local_rank', 0) == 0)
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]',
                 disable=not is_main)
@@ -395,15 +396,19 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
                 continue
         optimizer.step()
         total += loss.item()
+        num_updates += 1
         for k, v in losses.items():
             if k == 'total':
                 continue
             comp_acc[k] = comp_acc.get(k, 0.0) + float(v)
         if is_main:
             pbar.set_postfix(loss=loss.item())
-    n = max(len(loader), 1)
-    comp_acc = {k: v / n for k, v in comp_acc.items()}
-    return total / n, comp_acc, ss_prob
+    if num_updates == 0:
+        raise RuntimeError(
+            f'No training batches were processed at epoch={epoch}. '
+            'Check dataset path, max_items_per_category, world_size, batch_size, and drop_last.')
+    comp_acc = {k: v / num_updates for k, v in comp_acc.items()}
+    return total / num_updates, comp_acc, ss_prob
 
 
 @torch.no_grad()
@@ -411,6 +416,7 @@ def validate(model, renderer, loss_fn, loader, device, epoch, args):
     model.eval()
     total = 0.0
     comp_acc = {}
+    num_batches = 0
     is_main = (getattr(args, 'local_rank', 0) == 0)
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]', disable=not is_main)
     for step, batch in enumerate(pbar, start=1):
@@ -420,15 +426,19 @@ def validate(model, renderer, loss_fn, loader, device, epoch, args):
                 f'Non-finite val loss at epoch={epoch}, step={step}: '
                 f'{format_loss_components(losses)}')
         total += losses['total'].item()
+        num_batches += 1
         for k, v in losses.items():
             if k == 'total':
                 continue
             comp_acc[k] = comp_acc.get(k, 0.0) + float(v)
         if is_main:
             pbar.set_postfix(loss=losses['total'].item())
-    n = max(len(loader), 1)
-    comp_acc = {k: v / n for k, v in comp_acc.items()}
-    return total / n, comp_acc
+    if num_batches == 0:
+        raise RuntimeError(
+            f'No validation batches were processed at epoch={epoch}. '
+            'Check dataset path, val split/test files, world_size, and batch_size.')
+    comp_acc = {k: v / num_batches for k, v in comp_acc.items()}
+    return total / num_batches, comp_acc
 
 
 def save_checkpoint(model, optim, epoch, loss, save_path, args):
@@ -521,6 +531,13 @@ def main():
         num_workers=args.num_workers, pin_memory=True,
         persistent_workers=args.num_workers > 0,
     )
+    if len(train_loader) == 0 or len(val_loader) == 0:
+        raise ValueError(
+            'Empty DataLoader: '
+            f'train_ds={len(train_ds)}, val_ds={len(val_ds)}, '
+            f'train_loader={len(train_loader)}, val_loader={len(val_loader)}, '
+            f'batch_size={args.batch_size}, world_size={world_size}. '
+            'For phase1, verify --dataset_root points to QuickDraw-clean and enough samples are loaded.')
 
     # 3) 模型 + DDP 包装
     model, renderer, loss_fn = build_model_renderer_loss(args, device)
