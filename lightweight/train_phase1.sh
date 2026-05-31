@@ -9,8 +9,18 @@ PY=$CONDA_ENV/bin/python
 
 cd "$(dirname "$0")"
 
-if [ ! -d "datasets/QuickDraw-clean" ] && [ ! -d "../seq_extract/datasets/QuickDraw-clean" ]; then
-  echo "QuickDraw-clean not found, please prepare datasets first."
+DATASET_ROOT=""
+if compgen -G "datasets/QuickDraw-clean/train/*.npz" > /dev/null && \
+   compgen -G "datasets/QuickDraw-clean/test/*.npz" > /dev/null; then
+  DATASET_ROOT="datasets"
+elif compgen -G "../seq_extract/datasets/QuickDraw-clean/train/*.npz" > /dev/null && \
+     compgen -G "../seq_extract/datasets/QuickDraw-clean/test/*.npz" > /dev/null; then
+  DATASET_ROOT="../seq_extract/datasets"
+else
+  echo "QuickDraw-clean npz files not found."
+  echo "Expected one of:"
+  echo "  lightweight/datasets/QuickDraw-clean/{train,test}/*.npz"
+  echo "  seq_extract/datasets/QuickDraw-clean/{train,test}/*.npz"
   exit 1
 fi
 
@@ -29,7 +39,7 @@ export PYTHONNOUSERSITE=1
 # phase1 先关闭 VGG perceptual，避免 48-step closed-loop rollout 初期梯度过大直接 NaN。
 $PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --phase 1 \
-  --dataset_root ../seq_extract/datasets \
+  --dataset_root "$DATASET_ROOT" \
   --renderer_ckpt output_renderer/raster_unit_pretrained.pth \
   --output_dir output_ar_phase1_v2 \
   --image_size 256 \

@@ -619,4 +619,5 @@ if __name__ == '__main__':
     except Exception as e:
         print(f'Fatal error: {e}')
         traceback.print_exc()
+        cleanup_ddp()
         sys.exit(1)
