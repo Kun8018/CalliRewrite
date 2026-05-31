@@ -3,6 +3,7 @@
 # 用法:
 #   bash inference.sh                                          # 用默认 ckpt/input
 #   bash inference.sh --input path/to/image.png
+#   bash inference.sh --input ../seq_extract/sample_inputs/clean_line_drawings/duck.png
 #   bash inference.sh --checkpoint output_ar_phase1_v2/model_best.pth --input ../some_img.png
 set -e
 

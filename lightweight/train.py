@@ -126,6 +126,15 @@ def parse_args():
     p.add_argument('--w_early_pen', type=float, default=0.1)
     p.add_argument('--w_supervised', type=float, default=None,
                    help='默认 phase1=0.1, phase2=0.0')
+    p.add_argument('--use_perceptual', action='store_true', default=True)
+    p.add_argument('--no_perceptual', dest='use_perceptual', action='store_false',
+                   help='关闭 VGG perceptual loss；phase1 数值不稳定时建议关闭')
+    p.add_argument('--use_l1_raster', action='store_true', default=True)
+    p.add_argument('--no_l1_raster', dest='use_l1_raster', action='store_false')
+    p.add_argument('--fail_on_nonfinite', action='store_true', default=True,
+                   help='loss/grad 出现 NaN/Inf 时立即报错并打印 loss 分量')
+    p.add_argument('--skip_nonfinite', dest='fail_on_nonfinite', action='store_false',
+                   help='遇到 NaN/Inf batch 时跳过该 batch（不推荐，只用于临时抢救长训练）')
 
     p.add_argument('--device', type=str,
                    default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -239,6 +248,8 @@ def build_model_renderer_loss(args, device):
         win_outside_weight=args.w_win_outside,
         early_pen_weight=args.w_early_pen,
         supervised_weight=args.w_supervised,
+        use_perceptual=args.use_perceptual,
+        use_l1_raster=args.use_l1_raster,
         phase=args.phase,
     ).to(device)
     return model, renderer, loss_fn
@@ -334,6 +345,19 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: b
     return losses, rollout
 
 
+def format_loss_components(losses):
+    parts = []
+    for k, v in losses.items():
+        if torch.is_tensor(v):
+            if v.numel() == 1:
+                parts.append(f'{k}={v.detach().float().item():.6g}')
+            else:
+                parts.append(f'{k}=tensor{tuple(v.shape)}')
+        else:
+            parts.append(f'{k}={float(v):.6g}')
+    return ', '.join(parts)
+
+
 def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args):
     model.train()
     if hasattr(renderer.raster_unit, 'eval') and args.freeze_renderer:
@@ -344,13 +368,31 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
     is_main = (getattr(args, 'local_rank', 0) == 0)
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]',
                 disable=not is_main)
-    for batch in pbar:
+    for step, batch in enumerate(pbar, start=1):
         optimizer.zero_grad()
         losses, _ = run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training=True)
         loss = losses['total']
+        if not torch.isfinite(loss):
+            msg = (f'Non-finite train loss at epoch={epoch}, step={step}: '
+                   f'{format_loss_components(losses)}')
+            if args.fail_on_nonfinite:
+                raise FloatingPointError(msg)
+            if is_main:
+                print(f'[skip] {msg}')
+            continue
         loss.backward()
         if args.grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            grad_norm = nn.utils.clip_grad_norm_(
+                model.parameters(), args.grad_clip, error_if_nonfinite=args.fail_on_nonfinite)
+            if not torch.isfinite(grad_norm):
+                msg = (f'Non-finite grad norm at epoch={epoch}, step={step}: '
+                       f'grad_norm={grad_norm.item()}, {format_loss_components(losses)}')
+                if args.fail_on_nonfinite:
+                    raise FloatingPointError(msg)
+                if is_main:
+                    print(f'[skip] {msg}')
+                optimizer.zero_grad(set_to_none=True)
+                continue
         optimizer.step()
         total += loss.item()
         for k, v in losses.items():
@@ -371,8 +413,12 @@ def validate(model, renderer, loss_fn, loader, device, epoch, args):
     comp_acc = {}
     is_main = (getattr(args, 'local_rank', 0) == 0)
     pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]', disable=not is_main)
-    for batch in pbar:
+    for step, batch in enumerate(pbar, start=1):
         losses, _ = run_step(model, renderer, loss_fn, batch, device, args, 0.0, training=False)
+        if not torch.isfinite(losses['total']):
+            raise FloatingPointError(
+                f'Non-finite val loss at epoch={epoch}, step={step}: '
+                f'{format_loss_components(losses)}')
         total += losses['total'].item()
         for k, v in losses.items():
             if k == 'total':
