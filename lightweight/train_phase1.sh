@@ -42,8 +42,6 @@ $PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --batch_size 12 \
   --epochs 50 \
   --lr 1e-4 \
-  --ss_prob_start 1.0 \
-  --ss_prob_end 0.0 \
   --num_workers 2 \
   --use_tensorboard
 

@@ -2,6 +2,8 @@
 
 与 lightweight/ 的 ResNet 版本结构一致；唯一区别在 backbone：
 torchvision.vit_b_16 的预训练权重 + 单通道输入适配 + 224 输入。
+
+closed-loop 训练：不用 prev_stroke 特征、不做 scheduled sampling；训练时可注入 init_cursor。
 """
 import torch
 import torch.nn as nn
@@ -270,8 +272,7 @@ class ViTAutoregressiveExtractor7D(nn.Module):
             state.prev_window_size = torch.full_like(state.prev_window_size,
                                                      self.init_window_size)
             if init_cursor is not None:
-                # 训练时强制提供随机起点，迫使模型必须看 target 才能决定下一步。
-                # init_cursor: (N, 2) ∈ [0, 1)，由调用方采样。
+                # init_cursor: (N, 2) ∈ [0, 1)，由 train.py 从 stroke 像素采样
                 state.cursor = init_cursor.to(device=device, dtype=dtype)
         else:
             state = init_state

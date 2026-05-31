@@ -111,7 +111,7 @@ def parse_args():
 
     # 随机初始 cursor（关键：迫使模型必须看 target image）
     p.add_argument('--random_init_cursor', action='store_true', default=True,
-                   help='训练时每张图 cursor 随机起点（防止固化路径）')
+                   help='训练时从 stroke 像素随机采初始 cursor（防止固化路径）')
     p.add_argument('--no_random_init_cursor', dest='random_init_cursor', action='store_false')
     p.add_argument('--init_cursor_low', type=float, default=0.2)
     p.add_argument('--init_cursor_high', type=float, default=0.8)
@@ -127,7 +127,7 @@ def parse_args():
     p.add_argument('--w_win_outside', type=float, default=10.0)
     p.add_argument('--w_early_pen', type=float, default=0.1)
     p.add_argument('--w_supervised', type=float, default=None,
-                   help='默认 phase1=1.0, phase2=0.0')
+                   help='默认 phase1=0.1, phase2=0.0')
 
     p.add_argument('--device', type=str,
                    default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -257,10 +257,43 @@ def load_phase1_checkpoint(model, ckpt_path, device):
 
 
 def schedule_ss_prob(args, epoch):
-    if args.phase != 1 or args.epochs <= 1:
-        return 0.0  # phase 2 不需要 GT 笔画 scheduled sampling
-    frac = (epoch - 1) / (args.epochs - 1)
-    return args.ss_prob_start + frac * (args.ss_prob_end - args.ss_prob_start)
+    """scheduled sampling 已废弃，始终返回 0（保留供 CSV 列兼容）。"""
+    return 0.0
+
+
+def sample_init_cursors_from_stroke(target_stroke_img: torch.Tensor,
+                                    lo: float = 0.2,
+                                    hi: float = 0.8,
+                                    stroke_thresh: float = 0.5) -> torch.Tensor:
+    """从 target 笔画像素随机采初始 cursor，对齐 seq_extract gen_init_cursors。
+
+    target_stroke_img: (N, H, W) ∈ [0,1], 1=stroke
+    Returns: (N, 2) cursor (x, y) ∈ [0, 1)
+    """
+    N, H, W = target_stroke_img.shape
+    device = target_stroke_img.device
+    dtype = target_stroke_img.dtype
+
+    fallback = torch.rand(N, 2, device=device, dtype=dtype) * (hi - lo) + lo
+    init_cursor = fallback.clone()
+
+    for i in range(N):
+        ys, xs = torch.where(target_stroke_img[i] > stroke_thresh)
+        if ys.numel() == 0:
+            continue
+
+        x_norm = xs.to(dtype) / W
+        y_norm = ys.to(dtype) / H
+        in_bounds = ((x_norm >= lo) & (x_norm <= hi) &
+                     (y_norm >= lo) & (y_norm <= hi))
+        if in_bounds.any():
+            xs, ys = xs[in_bounds], ys[in_bounds]
+
+        pick = torch.randint(0, xs.numel(), (1,), device=device).item()
+        init_cursor[i, 0] = xs[pick].to(dtype) / W
+        init_cursor[i, 1] = ys[pick].to(dtype) / H
+
+    return init_cursor
 
 
 # --------------------------------------------------------------------- #
@@ -277,11 +310,13 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: b
         gt_strokes = gt_strokes.to(device, non_blocking=True)
         gt_mask = gt_mask.to(device, non_blocking=True)
 
-    # 训练时随机初始 cursor（防止模型固化"从 (0.5, 0.5) 起手"的 trivial 路径）
+    # 训练时从 stroke 像素随机采初始 cursor（防止固化"从 (0.5, 0.5) 起手"的 trivial 路径）
     if training and args.random_init_cursor:
-        N = target_image.shape[0]
-        lo, hi = args.init_cursor_low, args.init_cursor_high
-        init_cursor = torch.rand(N, 2, device=device) * (hi - lo) + lo
+        init_cursor = sample_init_cursors_from_stroke(
+            target_stroke_img,
+            lo=args.init_cursor_low,
+            hi=args.init_cursor_high,
+        )
     else:
         init_cursor = None
 
@@ -308,7 +343,7 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
     total = 0.0
     comp_acc = {}
     is_main = (getattr(args, 'local_rank', 0) == 0)
-    pbar = tqdm(loader, desc=f'Epoch {epoch} [Train] ss={ss_prob:.2f}',
+    pbar = tqdm(loader, desc=f'Epoch {epoch} [Train]',
                 disable=not is_main)
     for batch in pbar:
         optimizer.zero_grad()
@@ -450,9 +485,8 @@ def main():
         print(f'Model: {count_parameters(model)}')
 
     if world_size > 1:
-        # find_unused_parameters=True 因为 scheduled_sampling 等可能某些参数没走梯度
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=True)
+                    find_unused_parameters=False)
 
     optim_ = optim.AdamW(model.parameters(), lr=args.lr,
                           weight_decay=args.weight_decay)
@@ -476,7 +510,7 @@ def main():
         val_comp = {k: all_reduce_mean(v, world_size) for k, v in val_comp.items()}
 
         if is_main:
-            print(f'Epoch {epoch}/{args.epochs}  ss={ss_prob:.2f}  '
+            print(f'Epoch {epoch}/{args.epochs}  '
                   f'train={train_loss:.4f}  val={val_loss:.4f}  best={best:.4f}')
             print('  train_comp:', {k: round(v, 4) for k, v in train_comp.items()})
             print('  val_comp:',   {k: round(v, 4) for k, v in val_comp.items()})

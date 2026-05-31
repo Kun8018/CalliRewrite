@@ -43,8 +43,6 @@ $PY train.py \
   --batch_size 8 \
   --epochs 50 \
   --lr 1e-4 \
-  --ss_prob_start 1.0 \
-  --ss_prob_end 0.0 \
   --num_workers 4 \
   --device cuda:0 \
   --use_tensorboard

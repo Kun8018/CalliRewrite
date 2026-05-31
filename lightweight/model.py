@@ -9,7 +9,7 @@
    - pen = softmax(logits) → 取 P(pen=1) 的 softmax 软值（差分 argmax）
 2. forward 现在是真正的可微 rollout：caller 给出 step 数，模型自己迭代更新 cursor/canvas/window，
    全过程 torch 可微。
-3. 支持 scheduled sampling：训练时以一定概率把上一步的 prev_stroke 换成 GT。
+3. closed-loop 训练：不用 prev_stroke 特征、不做 scheduled sampling；训练时可注入随机 init_cursor。
 
 被 train.py 和 inference.py 共享。
 """
@@ -272,9 +272,9 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             target_image: (N, 1, H, W) ∈ [0, 1], 1=BG / 0=stroke（与 dataset 输出一致）
             neural_renderer: 预训练 NeuralRasterizorStep
             seq_len: rollout 步数；默认 self.max_seq_len
-            gt_strokes: (N, T, 7)，提供则可参与 scheduled sampling；否则纯 free run
-            scheduled_sampling_prob: 训练时把模型预测换成 GT 笔画作下一步输入的概率
-                                       (0=纯 free run, 1=teacher forcing)
+            gt_strokes: 保留签名兼容旧调用；rollout 内不再使用
+            scheduled_sampling_prob: 已废弃，保留签名兼容旧 shell
+            init_cursor: (N, 2) 可选初始 cursor；训练时由 train.py 从 stroke 像素采样
             detach_canvas_for_encoder: 把传给 encoder 的 canvas detach，避免长链 RNN 梯度
 
         Returns:
@@ -305,8 +305,7 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             state.prev_window_size = torch.full_like(state.prev_window_size,
                                                      self.init_window_size)
             if init_cursor is not None:
-                # 训练时强制提供随机起点，迫使模型必须看 target 才能决定下一步。
-                # init_cursor: (N, 2) ∈ [0, 1)，由调用方采样。
+                # init_cursor: (N, 2) ∈ [0, 1)，由 train.py 从 stroke 像素采样
                 state.cursor = init_cursor.to(device=device, dtype=dtype)
         else:
             state = init_state
