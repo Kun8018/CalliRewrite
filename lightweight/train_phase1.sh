@@ -36,7 +36,7 @@ export PYTHONNOUSERSITE=1
 # max_items_per_category=5000 → 共 5 万样本（10 类）/ epoch
 # cache_size=0 → 关闭 dataset 内存 cache（避免 4 rank × 8 worker × 12GB = OOM）
 # num_workers=2 → 4 rank × 2 = 8 worker 已够 GPU 不饿，且内存占用可控
-# phase1 先关闭 VGG perceptual，避免 48-step closed-loop rollout 初期梯度过大直接 NaN。
+# phase1 先做稳定的序列监督 warmup；raster/perceptual 放到后续微调再打开。
 $PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --phase 1 \
   --dataset_root "$DATASET_ROOT" \
@@ -54,7 +54,13 @@ $PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --epochs 50 \
   --lr 3e-5 \
   --grad_clip 0.5 \
+  --w_supervised 1.0 \
+  --w_raster 0.0 \
+  --w_outside 0.0 \
+  --w_win_outside 0.0 \
   --no_perceptual \
+  --no_l1_raster \
+  --no_random_init_cursor \
   --num_workers 2 \
   --use_tensorboard
 

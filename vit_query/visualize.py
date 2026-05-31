@@ -51,8 +51,9 @@ def iter_stroke_points(strokes_data, init_cursors, round_lengths, image_size):
             curr_window_size = float(np.clip(prev_scaling * prev_window_size, 32.0, image_size))
             x0 = float(cursor[0]) * image_size
             y0 = float(cursor[1]) * image_size
-            x1 = x0 + float(stroke[1]) * curr_window_size / 2.0
-            y1 = y0 + float(stroke[2]) * curr_window_size / 2.0
+            # x1/y1 是 patch 内 [0,1] 坐标，0.5 对应当前 cursor。
+            x1 = x0 + (float(stroke[1]) - 0.5) * curr_window_size
+            y1 = y0 + (float(stroke[2]) - 0.5) * curr_window_size
             x2 = x0 + float(stroke[3]) * curr_window_size / 2.0
             y2 = y0 + float(stroke[4]) * curr_window_size / 2.0
             points = []
@@ -137,9 +138,10 @@ def visualize_strokes(npz_path, original_img_path=None, output_dir=None):
     strokes_data = data['strokes_data']
     init_cursors = data['init_cursors'] if 'init_cursors' in data else np.array([[0.5, 0.5]], dtype=np.float32)
     round_lengths = data['round_length'] if 'round_length' in data else np.array([len(strokes_data)], dtype=np.int64)
+    image_size = int(np.asarray(data['image_size']).item()) if 'image_size' in data else 256
 
     # Order 图
-    order_img = generate_order_image(strokes_data, image_size=256, init_cursors=init_cursors, round_lengths=round_lengths)
+    order_img = generate_order_image(strokes_data, image_size=image_size, init_cursors=init_cursors, round_lengths=round_lengths)
     order_path = os.path.join(output_dir, 'order.png')
     order_img.save(order_path)
     print(f'Saved: {order_path}')
@@ -150,7 +152,7 @@ def visualize_strokes(npz_path, original_img_path=None, output_dir=None):
 
     for i in range(len(strokes_data)):
         color_img = generate_color_image(
-            strokes_data, i, image_size=256,
+            strokes_data, i, image_size=image_size,
             init_cursors=init_cursors, round_lengths=round_lengths
         )
         color_path = os.path.join(color_dir, f'{i:03d}.png')
@@ -161,7 +163,7 @@ def visualize_strokes(npz_path, original_img_path=None, output_dir=None):
     if original_img_path and os.path.exists(original_img_path):
         original_img = Image.open(original_img_path).convert('RGB')
         generated_img = generate_order_image(
-            strokes_data, image_size=256,
+            strokes_data, image_size=image_size,
             init_cursors=init_cursors, round_lengths=round_lengths
         )
         compare_img = generate_compare_image(original_img, generated_img)

@@ -147,9 +147,9 @@ def stroke3_to_normalized_xy(stroke3):
 
 def quickdraw_stroke3_to_7d(stroke3, img_size=256):
     """stroke3 (L, 3) [dx, dy, pen_lift] → seq7 (T, 7)。
-    跟 cursor/window 的逻辑一致：每点都按当前 cursor / window 求相对偏移。"""
+    x1/y1 是 patch 内控制点坐标 [0,1]，x2/y2 是相对 cursor 的终点偏移 [-1,1]。"""
     if len(stroke3) < 2:
-        return np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
+        return np.array([[1.0, 0.5, 0.5, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
     points = stroke3_to_normalized_xy(stroke3)
     return _normalized_points_to_seq7(points, stroke3[:, 2], img_size=img_size)
 
@@ -165,16 +165,17 @@ def _normalized_points_to_seq7(points, pen_lifts, img_size=256):
         cur = points[i]
         pen = 1.0 if pen_lifts[i - 1] > 0.5 else 0.0
         if pen == 1.0:
-            stroke = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0], dtype=np.float32)
+            stroke = np.array([1.0, 0.5, 0.5, 0.0, 0.0, 0.1, 1.0], dtype=np.float32)
         else:
             ctrl = (prev + cur) / 2.0
             scale = 2.0 * img_size / max(curr_window, 1e-6)
             ctrl_rel = (ctrl - cursor) * scale
             end_rel = (cur - cursor) * scale
+            ctrl_unit = (np.clip(ctrl_rel, -1.0, 1.0) + 1.0) / 2.0
             stroke = np.array([
                 0.0,
-                np.clip(ctrl_rel[0], -1.0, 1.0),
-                np.clip(ctrl_rel[1], -1.0, 1.0),
+                ctrl_unit[0],
+                ctrl_unit[1],
                 np.clip(end_rel[0], -1.0, 1.0),
                 np.clip(end_rel[1], -1.0, 1.0),
                 0.1,

@@ -13,8 +13,18 @@ export PYTHONNOUSERSITE=1
 
 cd "$(dirname "$0")"
 
-if [ ! -d "../seq_extract/datasets/QuickDraw-clean" ]; then
-  echo "QuickDraw-clean not found, please prepare datasets first."
+DATASET_ROOT=""
+if compgen -G "datasets/QuickDraw-clean/train/*.npz" > /dev/null && \
+   compgen -G "datasets/QuickDraw-clean/test/*.npz" > /dev/null; then
+  DATASET_ROOT="datasets"
+elif compgen -G "../seq_extract/datasets/QuickDraw-clean/train/*.npz" > /dev/null && \
+     compgen -G "../seq_extract/datasets/QuickDraw-clean/test/*.npz" > /dev/null; then
+  DATASET_ROOT="../seq_extract/datasets"
+else
+  echo "QuickDraw-clean npz files not found."
+  echo "Expected one of:"
+  echo "  vit_query/datasets/QuickDraw-clean/{train,test}/*.npz"
+  echo "  seq_extract/datasets/QuickDraw-clean/{train,test}/*.npz"
   exit 1
 fi
 
@@ -27,9 +37,10 @@ fi
 # max_items_per_category=5000 → 5 万样本 / epoch
 # cache_size=0 → 关闭 cache（worker fork 会复制 cache，易 OOM）
 # num_workers=8 → 配合 cache=0，减轻 CPU 数据瓶颈
+# phase1 先关闭 VGG perceptual，避免 48-step closed-loop rollout 初期梯度过大直接 NaN。
 $PY train.py \
   --phase 1 \
-  --dataset_root ../seq_extract/datasets \
+  --dataset_root "$DATASET_ROOT" \
   --renderer_ckpt output_renderer/raster_unit_pretrained.pth \
   --output_dir output_ar_phase1_v2 \
   --image_size 224 \
@@ -42,9 +53,10 @@ $PY train.py \
   --cache_size 0 \
   --batch_size 24 \
   --epochs 50 \
-  --lr 2e-4 \
+  --lr 3e-5 \
+  --grad_clip 0.5 \
+  --no_perceptual \
   --num_workers 8 \
-  --amp \
   --device cuda:0 \
   --use_tensorboard
 
