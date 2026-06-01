@@ -34,7 +34,11 @@ $PY train.py \
   --hidden_dim 256 \
   --batch_size 12 \
   --epochs 100 \
-  --lr 1e-4 \
+  --lr 1e-5 \
+  --grad_clip 0.25 \
+  --w_outside 1.0 \
+  --w_win_outside 1.0 \
+  --early_stop_patience 10 \
   --num_workers 8 \
   --device cuda:2 \
   --use_tensorboard

@@ -143,6 +143,9 @@ def parse_args():
                    default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--use_tensorboard', action='store_true')
     p.add_argument('--save_every', type=int, default=5)
+    p.add_argument('--early_stop_patience', type=int, default=0,
+                   help='验证集连续多少个 epoch 不提升后提前停止；0 表示关闭')
+    p.add_argument('--early_stop_min_delta', type=float, default=1e-4)
     return p.parse_args()
 
 
@@ -365,6 +368,8 @@ def format_loss_components(losses):
 
 def find_first_nonfinite_grad(model):
     named_params = model.module.named_parameters() if isinstance(model, DDP) else model.named_parameters()
+    max_name = None
+    max_abs = -1.0
     for name, param in named_params:
         grad = param.grad
         if grad is None:
@@ -374,7 +379,13 @@ def find_first_nonfinite_grad(model):
             bad = grad[~finite]
             bad_value = bad.flatten()[0].detach().float().item()
             return f'{name}: shape={tuple(grad.shape)}, first_bad_grad={bad_value}'
-    return 'unknown parameter'
+        current_max = grad.detach().abs().max().float().item()
+        if current_max > max_abs:
+            max_abs = current_max
+            max_name = name
+    if max_name is not None:
+        return f'all individual grads finite; max_abs_grad={max_abs:.6g} at {max_name}'
+    return 'no gradients'
 
 
 def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args):
@@ -575,6 +586,7 @@ def main():
                           weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optim_, T_max=args.epochs)
     best = float('inf')
+    epochs_without_improve = 0
 
     for epoch in range(1, args.epochs + 1):
         if train_sampler is not None:
@@ -611,16 +623,22 @@ def main():
                     writer.add_scalar(f'val/{k}', v, epoch)
                 writer.flush()
 
-            if val_loss < best:
+            if val_loss < best - args.early_stop_min_delta:
                 best = val_loss
+                epochs_without_improve = 0
                 save_checkpoint(model, optim_, epoch, val_loss,
                                 os.path.join(args.output_dir, 'model_best.pth'), args)
+            else:
+                epochs_without_improve += 1
             if epoch % args.save_every == 0:
                 save_checkpoint(model, optim_, epoch, val_loss,
                                 os.path.join(args.output_dir, f'model_epoch_{epoch}.pth'), args)
+            if args.early_stop_patience > 0 and epochs_without_improve >= args.early_stop_patience:
+                print(f'Early stopping: no val improvement for {epochs_without_improve} epochs.')
+                break
 
     if is_main:
-        save_checkpoint(model, optim_, args.epochs, val_loss,
+        save_checkpoint(model, optim_, epoch, val_loss,
                         os.path.join(args.output_dir, 'model_final.pth'), args)
         print(f'\nBest val loss: {best:.4f}')
         csv_file.close()
