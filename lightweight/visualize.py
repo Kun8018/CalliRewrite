@@ -47,8 +47,9 @@ def iter_stroke_points(strokes_data, init_cursors, round_lengths, image_size):
             curr_window_size = float(np.clip(prev_scaling * prev_window_size, 32.0, image_size))
             x0 = float(cursor[0]) * image_size
             y0 = float(cursor[1]) * image_size
-            x1 = x0 + float(stroke[1]) * curr_window_size / 2.0
-            y1 = y0 + float(stroke[2]) * curr_window_size / 2.0
+            # x1/y1 是 patch 内 [0,1] 坐标，0.5 对应当前 cursor。
+            x1 = x0 + (float(stroke[1]) - 0.5) * curr_window_size
+            y1 = y0 + (float(stroke[2]) - 0.5) * curr_window_size
             x2 = x0 + float(stroke[3]) * curr_window_size / 2.0
             y2 = y0 + float(stroke[4]) * curr_window_size / 2.0
             points = []

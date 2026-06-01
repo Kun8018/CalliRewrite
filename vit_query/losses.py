@@ -84,7 +84,7 @@ def angle_cost(pred_seq: torch.Tensor) -> torch.Tensor:
 def pos_outside_cost(pos_before: torch.Tensor, img_size: int) -> torch.Tensor:
     """pos_before: (N, T, 2) pixel-space pre-clip cursor 位置"""
     pos_after = torch.clamp(pos_before, 0.0, float(img_size - 1))
-    return (pos_before - pos_after).abs().mean()
+    return (pos_before - pos_after).abs().mean() / float(img_size)
 
 
 def win_size_outside_cost(win_before: torch.Tensor, img_size: int) -> torch.Tensor:

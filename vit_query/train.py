@@ -116,6 +116,9 @@ def parse_args():
     p.add_argument('--random_init_cursor', action='store_true', default=True,
                    help='训练时从 stroke 像素随机采初始 cursor（防止固化路径）')
     p.add_argument('--no_random_init_cursor', dest='random_init_cursor', action='store_false')
+    p.add_argument('--use_gt_init_cursor', action='store_true', default=True,
+                   help='phase1 有 GT 序列时使用数据里的真实起笔 cursor，对齐监督坐标')
+    p.add_argument('--no_gt_init_cursor', dest='use_gt_init_cursor', action='store_false')
     p.add_argument('--init_cursor_low', type=float, default=0.2)
     p.add_argument('--init_cursor_high', type=float, default=0.8)
 
@@ -324,8 +327,11 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: b
         gt_strokes = gt_strokes.to(device, non_blocking=True)
         gt_mask = gt_mask.to(device, non_blocking=True)
 
-    # 训练时从 stroke 像素随机采初始 cursor（防止固化"从 (0.5, 0.5) 起手"的 trivial 路径）
-    if training and args.random_init_cursor:
+    gt_init_cursor = batch.get('init_cursor')
+    if args.use_gt_init_cursor and gt_init_cursor is not None:
+        # phase1 的 seq7 监督坐标是相对真实起笔点编码的，必须用同一个起点 rollout。
+        init_cursor = gt_init_cursor.to(device, non_blocking=True)
+    elif training and args.random_init_cursor:
         init_cursor = sample_init_cursors_from_stroke(
             target_stroke_img,
             lo=args.init_cursor_low,
@@ -363,6 +369,28 @@ def format_loss_components(losses):
     return ', '.join(parts)
 
 
+def find_first_nonfinite_grad(model):
+    named_params = model.module.named_parameters() if isinstance(model, DDP) else model.named_parameters()
+    max_name = None
+    max_abs = -1.0
+    for name, param in named_params:
+        grad = param.grad
+        if grad is None:
+            continue
+        finite = torch.isfinite(grad)
+        if not finite.all():
+            bad = grad[~finite]
+            bad_value = bad.flatten()[0].detach().float().item()
+            return f'{name}: shape={tuple(grad.shape)}, first_bad_grad={bad_value}'
+        current_max = grad.detach().abs().max().float().item()
+        if current_max > max_abs:
+            max_abs = current_max
+            max_name = name
+    if max_name is not None:
+        return f'all individual grads finite; max_abs_grad={max_abs:.6g} at {max_name}'
+    return 'no gradients'
+
+
 def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args):
     model.train()
     if hasattr(renderer.raster_unit, 'eval') and args.freeze_renderer:
@@ -389,10 +417,12 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
         loss.backward()
         if args.grad_clip > 0:
             grad_norm = nn.utils.clip_grad_norm_(
-                model.parameters(), args.grad_clip, error_if_nonfinite=args.fail_on_nonfinite)
+                model.parameters(), args.grad_clip, error_if_nonfinite=False)
             if not torch.isfinite(grad_norm):
                 msg = (f'Non-finite grad norm at epoch={epoch}, step={step}: '
-                       f'grad_norm={grad_norm.item()}, {format_loss_components(losses)}')
+                       f'grad_norm={grad_norm.item()}, '
+                       f'bad_grad={find_first_nonfinite_grad(model)}, '
+                       f'{format_loss_components(losses)}')
                 if args.fail_on_nonfinite:
                     raise FloatingPointError(msg)
                 if is_main:

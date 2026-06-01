@@ -37,7 +37,7 @@ fi
 # max_items_per_category=5000 → 5 万样本 / epoch
 # cache_size=0 → 关闭 cache（worker fork 会复制 cache，易 OOM）
 # num_workers=8 → 配合 cache=0，减轻 CPU 数据瓶颈
-# phase1 先关闭 VGG perceptual，避免 48-step closed-loop rollout 初期梯度过大直接 NaN。
+# phase1 先做稳定的序列监督 warmup；raster/perceptual 放到后续微调再打开。
 $PY train.py \
   --phase 1 \
   --dataset_root "$DATASET_ROOT" \
@@ -55,7 +55,13 @@ $PY train.py \
   --epochs 50 \
   --lr 3e-5 \
   --grad_clip 0.5 \
+  --w_supervised 1.0 \
+  --w_raster 0.0 \
+  --w_outside 0.0 \
+  --w_win_outside 0.0 \
   --no_perceptual \
+  --no_l1_raster \
+  --no_random_init_cursor \
   --num_workers 8 \
   --device cuda:0 \
   --use_tensorboard
