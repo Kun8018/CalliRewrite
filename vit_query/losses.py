@@ -111,11 +111,12 @@ class SupervisedSeqLoss(nn.Module):
        - width/scaling: L1
        带 mask（GT 的有效长度）。"""
 
-    def __init__(self, w_pen=1.0, w_coord=5.0, w_param=1.0):
+    def __init__(self, w_pen=1.0, w_coord=5.0, w_param=1.0, w_tail_pen=0.5):
         super().__init__()
         self.w_pen = w_pen
         self.w_coord = w_coord
         self.w_param = w_param
+        self.w_tail_pen = w_tail_pen
 
     def forward(self, pred_seq: torch.Tensor, pen_logits: torch.Tensor,
                 gt: torch.Tensor, mask: torch.Tensor) -> dict:
@@ -128,7 +129,12 @@ class SupervisedSeqLoss(nn.Module):
         gt_pen_flat = gt_pen.reshape(-1)
         pen_loss_pix = F.cross_entropy(pen_logits_flat, gt_pen_flat, reduction='none')
         pen_loss_pix = pen_loss_pix.reshape(gt_pen.shape)
-        pen_loss = (pen_loss_pix * mask).sum() / mask_sum
+        pen_loss_valid = (pen_loss_pix * mask).sum() / mask_sum
+        tail_mask = 1.0 - mask
+        tail_sum = tail_mask.sum().clamp_min(1.0)
+        pen_loss_tail = (pen_loss_pix * tail_mask).sum() / tail_sum
+        has_tail = (tail_mask.sum() > 0).to(pen_loss_valid.dtype)
+        pen_loss = pen_loss_valid + self.w_tail_pen * has_tail * pen_loss_tail
 
         coord_diff = (pred_seq[..., 1:5] - gt[..., 1:5]).abs().mean(dim=-1)
         coord_loss = (coord_diff * mask).sum() / mask_sum
@@ -138,6 +144,7 @@ class SupervisedSeqLoss(nn.Module):
 
         total = self.w_pen * pen_loss + self.w_coord * coord_loss + self.w_param * param_loss
         return {'sup_total': total, 'sup_pen': pen_loss,
+                'sup_pen_valid': pen_loss_valid, 'sup_pen_tail': pen_loss_tail * has_tail,
                 'sup_coord': coord_loss, 'sup_param': param_loss}
 
 
@@ -158,6 +165,10 @@ class CombinedRolloutLoss(nn.Module):
                  early_pen_weight: float = 0.1,
                  early_pen_length: int = 7,
                  supervised_weight: float = 1.0,
+                 sup_pen_weight: float = 1.0,
+                 sup_coord_weight: float = 5.0,
+                 sup_param_weight: float = 1.0,
+                 sup_tail_pen_weight: float = 0.5,
                  use_perceptual: bool = True,
                  use_l1_raster: bool = True,
                  phase: int = 1):
@@ -177,7 +188,12 @@ class CombinedRolloutLoss(nn.Module):
 
         if use_perceptual:
             self.perceptual = PerceptualCost()
-        self.supervised = SupervisedSeqLoss()
+        self.supervised = SupervisedSeqLoss(
+            w_pen=sup_pen_weight,
+            w_coord=sup_coord_weight,
+            w_param=sup_param_weight,
+            w_tail_pen=sup_tail_pen_weight,
+        )
 
     def forward(self,
                 rollout_out: dict,

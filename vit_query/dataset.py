@@ -129,6 +129,10 @@ def pad_strokes(strokes: np.ndarray, max_seq_len: int):
     """(L, 7) → (max_seq_len, 7), mask (max_seq_len,), L"""
     L = min(len(strokes), max_seq_len)
     padded = np.zeros((max_seq_len, 7), dtype=np.float32)
+    padded[:, 0] = 1.0
+    padded[:, 1:3] = 0.5
+    padded[:, 5] = 0.1
+    padded[:, 6] = 1.0
     if L > 0:
         padded[:L] = strokes[:L]
     mask = np.zeros(max_seq_len, dtype=np.float32)

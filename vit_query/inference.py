@@ -36,7 +36,11 @@ def parse_args():
                    default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--pen_threshold', type=float, default=0.5)
     p.add_argument('--max_consecutive_lifts', type=int, default=3)
+    p.add_argument('--max_consecutive_downs', type=int, default=24,
+                   help='连续落笔超过该步数时截断；0 表示关闭')
     p.add_argument('--max_rounds', type=int, default=4)
+    p.add_argument('--init_cursor_strategy', choices=['center', 'stroke'], default='stroke',
+                   help='第一轮起笔位置：center=图像中心，stroke=最大未绘制笔画区域')
     return p.parse_args()
 
 
@@ -99,9 +103,30 @@ def trim_trailing_lifts(strokes: np.ndarray, max_consec: int):
     return strokes
 
 
+def trim_long_pen_down_run(strokes: np.ndarray, max_consec: int):
+    if max_consec <= 0:
+        return strokes
+    downs = 0
+    for i, s in enumerate(strokes):
+        if s[0] < 0.5:
+            downs += 1
+            if downs >= max_consec:
+                return strokes[:i + 1]
+        else:
+            downs = 0
+    return strokes
+
+
+def make_state_with_cursor(cursor: np.ndarray, image_size: int, device) -> RolloutState:
+    state = init_rollout_state(1, image_size, device)
+    state.cursor = torch.from_numpy(cursor.astype(np.float32)).to(device).unsqueeze(0)
+    return state
+
+
 @torch.no_grad()
 def infer_image(model, renderer, image_path, image_size, max_seq_len,
-                pen_threshold=0.5, max_consec=3, max_rounds=4, device='cuda'):
+                pen_threshold=0.5, max_consec=3, max_rounds=4,
+                init_cursor_strategy='stroke', max_consecutive_downs=24, device='cuda'):
     img_tensor = preprocess(image_path, image_size).to(device)  # (1, 1, H, W) 1=BG
     state = None
     hidden = None
@@ -110,25 +135,29 @@ def infer_image(model, renderer, image_path, image_size, max_seq_len,
     round_lengths = []
 
     target_np = (1.0 - img_tensor[0, 0]).cpu().numpy()  # (H, W) 1=stroke
+    first_cursor = None
+    if init_cursor_strategy == 'stroke':
+        first_cursor = find_undrawn_cursor(target_np, np.zeros_like(target_np))
+        if first_cursor is not None:
+            state = make_state_with_cursor(first_cursor, image_size, device)
 
     for round_idx in range(max_rounds):
-        # 第一轮 init_state=None → 默认从 (0.5, 0.5) 开始
-        # 第二轮起，state 已经包含上一轮 canvas + cursor
+        if round_idx == 0:
+            init_cursor_round = first_cursor if first_cursor is not None else np.array([0.5, 0.5], dtype=np.float32)
+        else:
+            init_cursor_round = state.cursor[0].cpu().numpy()
+
         out = model.rollout(img_tensor, renderer, seq_len=max_seq_len,
                             init_state=state, init_hidden=hidden,
                             detach_canvas_for_encoder=True)
         strokes = out['seq'][0].cpu().numpy().astype(np.float32)  # (T, 7)
         strokes[:, 0] = (strokes[:, 0] > pen_threshold).astype(np.float32)
         strokes = trim_trailing_lifts(strokes, max_consec)
+        strokes = trim_long_pen_down_run(strokes, max_consecutive_downs)
 
         if len(strokes) == 0:
             break
 
-        init_cursor_round = out['cursors'][0, 0].cpu().numpy() if round_idx == 0 \
-            else state.cursor[0].cpu().numpy()
-        # 第一轮起点其实是 (0.5, 0.5)
-        if round_idx == 0:
-            init_cursor_round = np.array([0.5, 0.5], dtype=np.float32)
         init_cursors.append(init_cursor_round.copy())
         round_lengths.append(len(strokes))
         all_strokes.append(strokes)
@@ -158,7 +187,7 @@ def infer_image(model, renderer, image_path, image_size, max_seq_len,
         hidden = None  # 新一轮 GRU hidden 重置
 
     if not all_strokes:
-        strokes_final = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
+        strokes_final = np.array([[1.0, 0.5, 0.5, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
         round_lengths = [1]
         init_cursors = [np.array([0.5, 0.5], dtype=np.float32)]
     else:
@@ -191,6 +220,8 @@ def process_one(model, renderer, image_path, output_dir, image_size, max_seq_len
         pen_threshold=args.pen_threshold,
         max_consec=args.max_consecutive_lifts,
         max_rounds=args.max_rounds,
+        init_cursor_strategy=args.init_cursor_strategy,
+        max_consecutive_downs=args.max_consecutive_downs,
         device=device,
     )
     os.makedirs(output_dir, exist_ok=True)
