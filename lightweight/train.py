@@ -106,6 +106,8 @@ def parse_args():
                    help='[已废弃] scheduled sampling 起始概率')
     p.add_argument('--ss_prob_end', type=float, default=0.0,
                    help='[已废弃] scheduled sampling 终点概率')
+    p.add_argument('--teacher_forcing_prob', type=float, default=None,
+                   help='phase1 训练时用 GT 当前笔推进 rollout 状态的概率；默认 phase1=1, phase2=0')
 
     # 随机初始 cursor（关键：迫使模型必须看 target image）
     p.add_argument('--random_init_cursor', action='store_true', default=True,
@@ -129,6 +131,10 @@ def parse_args():
     p.add_argument('--w_early_pen', type=float, default=0.1)
     p.add_argument('--w_supervised', type=float, default=None,
                    help='默认 phase1=0.1, phase2=0.0')
+    p.add_argument('--w_sup_pen', type=float, default=1.0)
+    p.add_argument('--w_sup_coord', type=float, default=5.0)
+    p.add_argument('--w_sup_param', type=float, default=1.0)
+    p.add_argument('--w_sup_tail_pen', type=float, default=0.5)
     p.add_argument('--use_perceptual', action='store_true', default=True)
     p.add_argument('--no_perceptual', dest='use_perceptual', action='store_false',
                    help='关闭 VGG perceptual loss；phase1 数值不稳定时建议关闭')
@@ -157,10 +163,12 @@ def setdefault_weights_by_phase(args):
         # 强监督 coord/param 会拖累训练。只保留弱信号约束 pen state 节奏。
         # raster_l1 + perceptual 是主信号。
         if args.w_supervised is None: args.w_supervised = 0.1
+        if args.teacher_forcing_prob is None: args.teacher_forcing_prob = 1.0
     else:
         if args.w_smoothness is None: args.w_smoothness = 0.5
         if args.w_angle is None:      args.w_angle = 1.0
         if args.w_supervised is None: args.w_supervised = 0.0
+        if args.teacher_forcing_prob is None: args.teacher_forcing_prob = 0.0
 
 
 # --------------------------------------------------------------------- #
@@ -254,6 +262,10 @@ def build_model_renderer_loss(args, device):
         win_outside_weight=args.w_win_outside,
         early_pen_weight=args.w_early_pen,
         supervised_weight=args.w_supervised,
+        sup_pen_weight=args.w_sup_pen,
+        sup_coord_weight=args.w_sup_coord,
+        sup_param_weight=args.w_sup_param,
+        sup_tail_pen_weight=args.w_sup_tail_pen,
         use_perceptual=args.use_perceptual,
         use_l1_raster=args.use_l1_raster,
         phase=args.phase,
@@ -345,6 +357,7 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: b
         seq_len=args.max_seq_len,
         gt_strokes=gt_strokes,
         scheduled_sampling_prob=ss_prob,
+        teacher_forcing_prob=args.teacher_forcing_prob if training else 0.0,
         init_cursor=init_cursor,
     )
 

@@ -21,6 +21,7 @@ INPUT="../seq_extract/outputs/__new_train_phase_2/0.png"
 OUTPUT_DIR="inference_output_v2"
 DEVICE="cuda:0"
 MAX_CONSECUTIVE_LIFTS=3
+MAX_CONSECUTIVE_DOWNS=24
 MAX_ROUNDS=1
 INIT_CURSOR_STRATEGY="stroke"
 
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --output_dir)        OUTPUT_DIR="$2"; shift 2;;
     --device)            DEVICE="$2"; shift 2;;
     --max_consecutive_lifts) MAX_CONSECUTIVE_LIFTS="$2"; shift 2;;
+    --max_consecutive_downs) MAX_CONSECUTIVE_DOWNS="$2"; shift 2;;
     --max_rounds)        MAX_ROUNDS="$2"; shift 2;;
     --init_cursor_strategy) INIT_CURSOR_STRATEGY="$2"; shift 2;;
     *) echo "Unknown option: $1"; exit 1;;
@@ -68,5 +70,6 @@ $PY inference.py \
   --output_dir "$OUTPUT_DIR" \
   --device "$DEVICE" \
   --max_consecutive_lifts "$MAX_CONSECUTIVE_LIFTS" \
+  --max_consecutive_downs "$MAX_CONSECUTIVE_DOWNS" \
   --max_rounds "$MAX_ROUNDS" \
   --init_cursor_strategy "$INIT_CURSOR_STRATEGY"

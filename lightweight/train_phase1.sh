@@ -54,10 +54,17 @@ $PY -m torch.distributed.run --standalone --nproc_per_node=4 train.py \
   --epochs 50 \
   --lr 3e-5 \
   --grad_clip 0.5 \
+  --teacher_forcing_prob 1.0 \
   --w_supervised 1.0 \
+  --w_sup_pen 5.0 \
+  --w_sup_coord 2.0 \
+  --w_sup_param 0.5 \
+  --w_sup_tail_pen 1.0 \
   --w_raster 0.0 \
+  --w_stroke_num 0.0 \
   --w_outside 0.0 \
   --w_win_outside 0.0 \
+  --w_early_pen 0.0 \
   --no_perceptual \
   --no_l1_raster \
   --no_random_init_cursor \

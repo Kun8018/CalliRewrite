@@ -36,6 +36,8 @@ def parse_args():
                    default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--pen_threshold', type=float, default=0.5)
     p.add_argument('--max_consecutive_lifts', type=int, default=3)
+    p.add_argument('--max_consecutive_downs', type=int, default=24,
+                   help='连续落笔超过该步数时截断；0 表示关闭')
     p.add_argument('--max_rounds', type=int, default=4)
     p.add_argument('--init_cursor_strategy', choices=['center', 'stroke'], default='stroke',
                    help='第一轮起笔位置：center=图像中心，stroke=最大未绘制笔画区域')
@@ -100,6 +102,20 @@ def trim_trailing_lifts(strokes: np.ndarray, max_consec: int):
     return strokes
 
 
+def trim_long_pen_down_run(strokes: np.ndarray, max_consec: int):
+    if max_consec <= 0:
+        return strokes
+    downs = 0
+    for i, s in enumerate(strokes):
+        if s[0] < 0.5:
+            downs += 1
+            if downs >= max_consec:
+                return strokes[:i + 1]
+        else:
+            downs = 0
+    return strokes
+
+
 def make_state_with_cursor(cursor: np.ndarray, image_size: int, device) -> RolloutState:
     state = init_rollout_state(1, image_size, device)
     state.cursor = torch.from_numpy(cursor.astype(np.float32)).to(device).unsqueeze(0)
@@ -109,7 +125,7 @@ def make_state_with_cursor(cursor: np.ndarray, image_size: int, device) -> Rollo
 @torch.no_grad()
 def infer_image(model, renderer, image_path, image_size, max_seq_len,
                 pen_threshold=0.5, max_consec=3, max_rounds=4,
-                init_cursor_strategy='stroke', device='cuda'):
+                init_cursor_strategy='stroke', max_consecutive_downs=24, device='cuda'):
     img_tensor = preprocess(image_path, image_size).to(device)  # (1, 1, H, W) 1=BG
     state = None
     hidden = None
@@ -136,6 +152,7 @@ def infer_image(model, renderer, image_path, image_size, max_seq_len,
         strokes = out['seq'][0].cpu().numpy().astype(np.float32)  # (T, 7)
         strokes[:, 0] = (strokes[:, 0] > pen_threshold).astype(np.float32)
         strokes = trim_trailing_lifts(strokes, max_consec)
+        strokes = trim_long_pen_down_run(strokes, max_consecutive_downs)
 
         if len(strokes) == 0:
             break
@@ -203,6 +220,7 @@ def process_one(model, renderer, image_path, output_dir, image_size, max_seq_len
         max_consec=args.max_consecutive_lifts,
         max_rounds=args.max_rounds,
         init_cursor_strategy=args.init_cursor_strategy,
+        max_consecutive_downs=args.max_consecutive_downs,
         device=device,
     )
     os.makedirs(output_dir, exist_ok=True)

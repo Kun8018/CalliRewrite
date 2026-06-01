@@ -133,6 +133,19 @@ class StrokeHead(nn.Module):
         }
 
 
+def stroke7_to_step_pred(stroke7: torch.Tensor) -> dict:
+    """把 GT seq7 的一步转换成 step_with_renderer 可消费的 pred dict。"""
+    pen = stroke7[:, 0]
+    return {
+        'pen_state_soft': pen,
+        'pen_state_hard': pen,
+        'x1y1': stroke7[:, 1:3],
+        'x2y2': stroke7[:, 3:5],
+        'width': stroke7[:, 5:6],
+        'scaling': stroke7[:, 6:7],
+    }
+
+
 class ResNetAutoregressiveExtractor7D(nn.Module):
     """对齐 seq_extract VirtualSketchingModel 的简化 PyTorch 版本。
 
@@ -260,8 +273,9 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
                 target_image: torch.Tensor,
                 neural_renderer,
                 seq_len: int = None,
-                gt_strokes: torch.Tensor = None,  # noqa: ARG002 — 保留签名兼容旧 train.py 调用
-                scheduled_sampling_prob: float = 0.0,  # noqa: ARG002 — 同上，scheduled sampling 已废弃
+                gt_strokes: torch.Tensor = None,
+                scheduled_sampling_prob: float = 0.0,  # noqa: ARG002 — 保留旧参数兼容
+                teacher_forcing_prob: float = 0.0,
                 detach_canvas_for_encoder: bool = True,
                 init_state: RolloutState = None,
                 init_hidden: torch.Tensor = None,
@@ -344,8 +358,16 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             # 记录中间值（pre-step）
             pen_logits_list.append(pred['pen_logits'])
 
-            # 推进 state
-            state, info = step_with_renderer(state, pred, neural_renderer,
+            # phase1 warmup: 可用 GT 当前笔推进状态，让下一步输入状态与 GT 序列对齐。
+            step_pred = pred
+            if gt_strokes is not None and t < gt_strokes.shape[1] and teacher_forcing_prob > 0.0:
+                use_gt = teacher_forcing_prob >= 1.0
+                if not use_gt and self.training:
+                    use_gt = bool(torch.rand((), device=device) < teacher_forcing_prob)
+                if use_gt:
+                    step_pred = stroke7_to_step_pred(gt_strokes[:, t].to(device=device, dtype=dtype))
+
+            state, info = step_with_renderer(state, step_pred, neural_renderer,
                                              raster_size=self.raster_size)
 
             # 组装 7D stroke 输出（与原 seq_extract 的 pred_params 对齐：
