@@ -108,6 +108,13 @@ def parse_args():
                    help='[已废弃] scheduled sampling 终点概率')
     p.add_argument('--teacher_forcing_prob', type=float, default=None,
                    help='phase1 训练时用 GT 当前笔推进 rollout 状态的概率；默认 phase1=1, phase2=0')
+    p.add_argument('--teacher_forcing_end', type=float, default=None,
+                   help='phase1 teacher forcing 线性衰减到的终值；不设则不衰减')
+    p.add_argument('--teacher_forcing_decay_epochs', type=int, default=0,
+                   help='phase1 teacher forcing 从起值衰减到终值所用 epoch 数；0 表示关闭衰减')
+    p.add_argument('--best_metric', type=str, default='val_free',
+                   choices=['val_free', 'val_tf'],
+                   help='phase1 保存 model_best.pth 使用的验证指标')
 
     # 随机初始 cursor（关键：迫使模型必须看 target image）
     p.add_argument('--random_init_cursor', action='store_true', default=True,
@@ -291,6 +298,17 @@ def schedule_ss_prob(args, epoch):
     return 0.0
 
 
+def schedule_teacher_forcing_prob(args, epoch):
+    """Phase1 先用 GT 对齐状态学习单步预测，再逐步切到闭环 rollout。"""
+    start = float(args.teacher_forcing_prob or 0.0)
+    if args.phase != 1 or args.teacher_forcing_end is None or args.teacher_forcing_decay_epochs <= 1:
+        return start
+
+    end = float(args.teacher_forcing_end)
+    progress = min(max((epoch - 1) / float(args.teacher_forcing_decay_epochs - 1), 0.0), 1.0)
+    return start + (end - start) * progress
+
+
 def sample_init_cursors_from_stroke(target_stroke_img: torch.Tensor,
                                     lo: float = 0.2,
                                     hi: float = 0.8,
@@ -330,7 +348,8 @@ def sample_init_cursors_from_stroke(target_stroke_img: torch.Tensor,
 # step
 # --------------------------------------------------------------------- #
 
-def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: bool):
+def run_step(model, renderer, loss_fn, batch, device, args, ss_prob,
+             training: bool, teacher_forcing_prob: float = None):
     target_image = batch['target_image'].to(device, non_blocking=True)            # (N, 1, H, W) 1=BG
     target_stroke_img = batch['target_stroke_img'].to(device, non_blocking=True)  # (N, H, W) 1=stroke
 
@@ -355,12 +374,14 @@ def run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training: b
 
     # DDP 包装后 model(*) 会拦截 forward 做 gradient reduce；
     # forward 内部就是 rollout（见 model.py）
+    if teacher_forcing_prob is None:
+        teacher_forcing_prob = args.teacher_forcing_prob if training else 0.0
     rollout = model(
         target_image, renderer,
         seq_len=args.max_seq_len,
         gt_strokes=gt_strokes,
         scheduled_sampling_prob=ss_prob,
-        teacher_forcing_prob=args.teacher_forcing_prob if training else 0.0,
+        teacher_forcing_prob=teacher_forcing_prob,
         init_cursor=init_cursor,
     )
 
@@ -409,6 +430,7 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
     if hasattr(renderer.raster_unit, 'eval') and args.freeze_renderer:
         renderer.raster_unit.eval()
     ss_prob = schedule_ss_prob(args, epoch)
+    tf_prob = schedule_teacher_forcing_prob(args, epoch)
     total = 0.0
     comp_acc = {}
     num_updates = 0
@@ -417,7 +439,8 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
                 disable=not is_main)
     for step, batch in enumerate(pbar, start=1):
         optimizer.zero_grad()
-        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, ss_prob, training=True)
+        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, ss_prob,
+                             training=True, teacher_forcing_prob=tf_prob)
         loss = losses['total']
         if not torch.isfinite(loss):
             msg = (f'Non-finite train loss at epoch={epoch}, step={step}: '
@@ -456,19 +479,21 @@ def train_epoch(model, renderer, loss_fn, loader, optimizer, device, epoch, args
             f'No training batches were processed at epoch={epoch}. '
             'Check dataset path, max_items_per_category, world_size, batch_size, and drop_last.')
     comp_acc = {k: v / num_updates for k, v in comp_acc.items()}
-    return total / num_updates, comp_acc, ss_prob
+    return total / num_updates, comp_acc, ss_prob, tf_prob
 
 
 @torch.no_grad()
-def validate(model, renderer, loss_fn, loader, device, epoch, args):
+def validate(model, renderer, loss_fn, loader, device, epoch, args,
+             teacher_forcing_prob: float = 0.0, tag: str = 'Val'):
     model.eval()
     total = 0.0
     comp_acc = {}
     num_batches = 0
     is_main = (getattr(args, 'local_rank', 0) == 0)
-    pbar = tqdm(loader, desc=f'Epoch {epoch} [Val]', disable=not is_main)
+    pbar = tqdm(loader, desc=f'Epoch {epoch} [{tag}]', disable=not is_main)
     for step, batch in enumerate(pbar, start=1):
-        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, 0.0, training=False)
+        losses, _ = run_step(model, renderer, loss_fn, batch, device, args, 0.0,
+                             training=False, teacher_forcing_prob=teacher_forcing_prob)
         if not torch.isfinite(losses['total']):
             raise FloatingPointError(
                 f'Non-finite val loss at epoch={epoch}, step={step}: '
@@ -543,7 +568,10 @@ def main():
         csv_path = os.path.join(args.output_dir, 'train_log.csv')
         csv_file = open(csv_path, 'w', buffering=1)
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(['epoch', 'ss_prob', 'train_loss', 'val_loss', 'best_val_loss'])
+        csv_writer.writerow([
+            'epoch', 'ss_prob', 'tf_prob',
+            'train_loss', 'val_tf_loss', 'val_free_loss', 'best_val_loss',
+        ])
         if args.use_tensorboard:
             try:
                 from torch.utils.tensorboard import SummaryWriter
@@ -608,53 +636,70 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        train_loss, train_comp, ss_prob = train_epoch(
+        train_loss, train_comp, ss_prob, tf_prob = train_epoch(
             model, renderer, loss_fn, train_loader, optim_, device, epoch, args)
-        val_loss, val_comp = validate(
-            model, renderer, loss_fn, val_loader, device, epoch, args)
+        val_tf_loss, val_tf_comp = validate(
+            model, renderer, loss_fn, val_loader, device, epoch, args,
+            teacher_forcing_prob=tf_prob, tag='ValTF')
+        val_free_loss, val_free_comp = validate(
+            model, renderer, loss_fn, val_loader, device, epoch, args,
+            teacher_forcing_prob=0.0, tag='ValFree')
+        metric_loss = val_free_loss if args.best_metric == 'val_free' else val_tf_loss
         scheduler.step()
 
         # 跨 rank 平均 loss 显示
         train_loss = all_reduce_mean(train_loss, world_size)
-        val_loss = all_reduce_mean(val_loss, world_size)
+        val_tf_loss = all_reduce_mean(val_tf_loss, world_size)
+        val_free_loss = all_reduce_mean(val_free_loss, world_size)
+        metric_loss = all_reduce_mean(metric_loss, world_size)
         train_comp = {k: all_reduce_mean(v, world_size) for k, v in train_comp.items()}
-        val_comp = {k: all_reduce_mean(v, world_size) for k, v in val_comp.items()}
+        val_tf_comp = {k: all_reduce_mean(v, world_size) for k, v in val_tf_comp.items()}
+        val_free_comp = {k: all_reduce_mean(v, world_size) for k, v in val_free_comp.items()}
 
         if is_main:
             print(f'Epoch {epoch}/{args.epochs}  '
-                  f'train={train_loss:.4f}  val={val_loss:.4f}  best={best:.4f}')
+                  f'train={train_loss:.4f}  val_tf={val_tf_loss:.4f}  '
+                  f'val_free={val_free_loss:.4f}  best({args.best_metric})={best:.4f}  '
+                  f'tf_prob={tf_prob:.3f}')
             print('  train_comp:', {k: round(v, 4) for k, v in train_comp.items()})
-            print('  val_comp:',   {k: round(v, 4) for k, v in val_comp.items()})
+            print('  val_tf_comp:',   {k: round(v, 4) for k, v in val_tf_comp.items()})
+            print('  val_free_comp:', {k: round(v, 4) for k, v in val_free_comp.items()})
 
-            csv_writer.writerow([epoch, ss_prob, train_loss, val_loss, best,
+            csv_writer.writerow([epoch, ss_prob, tf_prob, train_loss,
+                                 val_tf_loss, val_free_loss, best,
                                  *[round(v, 6) for v in train_comp.values()],
-                                 *[round(v, 6) for v in val_comp.values()]])
+                                 *[round(v, 6) for v in val_tf_comp.values()],
+                                 *[round(v, 6) for v in val_free_comp.values()]])
             if writer:
                 writer.add_scalar('loss/train', train_loss, epoch)
-                writer.add_scalar('loss/val', val_loss, epoch)
+                writer.add_scalar('loss/val_tf', val_tf_loss, epoch)
+                writer.add_scalar('loss/val_free', val_free_loss, epoch)
                 writer.add_scalar('ss_prob', ss_prob, epoch)
+                writer.add_scalar('tf_prob', tf_prob, epoch)
                 for k, v in train_comp.items():
                     writer.add_scalar(f'train/{k}', v, epoch)
-                for k, v in val_comp.items():
-                    writer.add_scalar(f'val/{k}', v, epoch)
+                for k, v in val_tf_comp.items():
+                    writer.add_scalar(f'val_tf/{k}', v, epoch)
+                for k, v in val_free_comp.items():
+                    writer.add_scalar(f'val_free/{k}', v, epoch)
                 writer.flush()
 
-            if val_loss < best - args.early_stop_min_delta:
-                best = val_loss
+            if metric_loss < best - args.early_stop_min_delta:
+                best = metric_loss
                 epochs_without_improve = 0
-                save_checkpoint(model, optim_, epoch, val_loss,
+                save_checkpoint(model, optim_, epoch, metric_loss,
                                 os.path.join(args.output_dir, 'model_best.pth'), args)
             else:
                 epochs_without_improve += 1
             if epoch % args.save_every == 0:
-                save_checkpoint(model, optim_, epoch, val_loss,
+                save_checkpoint(model, optim_, epoch, metric_loss,
                                 os.path.join(args.output_dir, f'model_epoch_{epoch}.pth'), args)
             if args.early_stop_patience > 0 and epochs_without_improve >= args.early_stop_patience:
                 print(f'Early stopping: no val improvement for {epochs_without_improve} epochs.')
                 break
 
     if is_main:
-        save_checkpoint(model, optim_, epoch, val_loss,
+        save_checkpoint(model, optim_, epoch, metric_loss,
                         os.path.join(args.output_dir, 'model_final.pth'), args)
         print(f'\nBest val loss: {best:.4f}')
         csv_file.close()
