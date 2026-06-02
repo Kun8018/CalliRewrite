@@ -57,10 +57,11 @@ $PY train.py \
   --grad_clip 0.5 \
   --teacher_forcing_prob 1.0 \
   --w_supervised 1.0 \
-  --w_sup_pen 5.0 \
+  --w_sup_pen 3.0 \
+  --w_sup_pen_up 8.0 \
   --w_sup_coord 2.0 \
   --w_sup_param 0.5 \
-  --w_sup_tail_pen 1.0 \
+  --w_sup_tail_pen 0.5 \
   --w_raster 0.0 \
   --w_stroke_num 0.0 \
   --w_outside 0.0 \

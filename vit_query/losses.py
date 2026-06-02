@@ -111,12 +111,14 @@ class SupervisedSeqLoss(nn.Module):
        - width/scaling: L1
        带 mask（GT 的有效长度）。"""
 
-    def __init__(self, w_pen=1.0, w_coord=5.0, w_param=1.0, w_tail_pen=0.5):
+    def __init__(self, w_pen=1.0, w_coord=5.0, w_param=1.0,
+                 w_tail_pen=0.5, pen_up_weight=1.0):
         super().__init__()
         self.w_pen = w_pen
         self.w_coord = w_coord
         self.w_param = w_param
         self.w_tail_pen = w_tail_pen
+        self.pen_up_weight = pen_up_weight
 
     def forward(self, pred_seq: torch.Tensor, pen_logits: torch.Tensor,
                 gt: torch.Tensor, mask: torch.Tensor) -> dict:
@@ -127,7 +129,16 @@ class SupervisedSeqLoss(nn.Module):
         # 用 cross_entropy；先 flatten
         pen_logits_flat = pen_logits.reshape(-1, 2)
         gt_pen_flat = gt_pen.reshape(-1)
-        pen_loss_pix = F.cross_entropy(pen_logits_flat, gt_pen_flat, reduction='none')
+        pen_class_weight = torch.tensor(
+            [1.0, self.pen_up_weight],
+            device=pen_logits.device,
+            dtype=pen_logits.dtype,
+        )
+        pen_loss_pix = F.cross_entropy(
+            pen_logits_flat, gt_pen_flat,
+            weight=pen_class_weight,
+            reduction='none',
+        )
         pen_loss_pix = pen_loss_pix.reshape(gt_pen.shape)
         pen_loss_valid = (pen_loss_pix * mask).sum() / mask_sum
         tail_mask = 1.0 - mask
@@ -142,9 +153,14 @@ class SupervisedSeqLoss(nn.Module):
         param_diff = (pred_seq[..., 5:7] - gt[..., 5:7]).abs().mean(dim=-1)
         param_loss = (param_diff * mask).sum() / mask_sum
 
+        gt_pen_up_rate = (gt_pen.float() * mask).sum() / mask_sum
+        pred_pen_up_prob = (F.softmax(pen_logits, dim=-1)[..., 1] * mask).sum() / mask_sum
+
         total = self.w_pen * pen_loss + self.w_coord * coord_loss + self.w_param * param_loss
         return {'sup_total': total, 'sup_pen': pen_loss,
                 'sup_pen_valid': pen_loss_valid, 'sup_pen_tail': pen_loss_tail * has_tail,
+                'sup_gt_pen_up_rate': gt_pen_up_rate,
+                'sup_pred_pen_up_prob': pred_pen_up_prob,
                 'sup_coord': coord_loss, 'sup_param': param_loss}
 
 
@@ -169,6 +185,7 @@ class CombinedRolloutLoss(nn.Module):
                  sup_coord_weight: float = 5.0,
                  sup_param_weight: float = 1.0,
                  sup_tail_pen_weight: float = 0.5,
+                 sup_pen_up_weight: float = 1.0,
                  use_perceptual: bool = True,
                  use_l1_raster: bool = True,
                  phase: int = 1):
@@ -193,6 +210,7 @@ class CombinedRolloutLoss(nn.Module):
             w_coord=sup_coord_weight,
             w_param=sup_param_weight,
             w_tail_pen=sup_tail_pen_weight,
+            pen_up_weight=sup_pen_up_weight,
         )
 
     def forward(self,

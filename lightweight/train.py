@@ -135,6 +135,8 @@ def parse_args():
     p.add_argument('--w_sup_coord', type=float, default=5.0)
     p.add_argument('--w_sup_param', type=float, default=1.0)
     p.add_argument('--w_sup_tail_pen', type=float, default=0.5)
+    p.add_argument('--w_sup_pen_up', type=float, default=1.0,
+                   help='监督 pen loss 中 GT pen-up 类别的额外权重')
     p.add_argument('--use_perceptual', action='store_true', default=True)
     p.add_argument('--no_perceptual', dest='use_perceptual', action='store_false',
                    help='关闭 VGG perceptual loss；phase1 数值不稳定时建议关闭')
@@ -266,6 +268,7 @@ def build_model_renderer_loss(args, device):
         sup_coord_weight=args.w_sup_coord,
         sup_param_weight=args.w_sup_param,
         sup_tail_pen_weight=args.w_sup_tail_pen,
+        sup_pen_up_weight=args.w_sup_pen_up,
         use_perceptual=args.use_perceptual,
         use_l1_raster=args.use_l1_raster,
         phase=args.phase,
