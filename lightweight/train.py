@@ -23,6 +23,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import random_split, DataLoader, DistributedSampler
 from tqdm import tqdm
+from PIL import Image, ImageDraw
 
 from model import ResNetAutoregressiveExtractor7D, count_parameters
 from neural_renderer import NeuralRasterizorStep
@@ -112,9 +113,17 @@ def parse_args():
                    help='phase1 teacher forcing 线性衰减到的终值；不设则不衰减')
     p.add_argument('--teacher_forcing_decay_epochs', type=int, default=0,
                    help='phase1 teacher forcing 从起值衰减到终值所用 epoch 数；0 表示关闭衰减')
-    p.add_argument('--best_metric', type=str, default='val_free',
+    p.add_argument('--teacher_forcing_warmup_epochs', type=int, default=0,
+                   help='phase1 前多少个 epoch 保持 teacher forcing 起值不衰减')
+    p.add_argument('--best_metric', type=str, default='val_tf',
                    choices=['val_free', 'val_tf'],
-                   help='phase1 保存 model_best.pth 使用的验证指标')
+                   help='兼容旧参数；主流程会同时保存 model_best_tf/free.pth')
+    p.add_argument('--viz_every', type=int, default=0,
+                   help='每隔多少 epoch 保存固定样本的 TF100/Free 对比图；0 表示关闭')
+    p.add_argument('--viz_category', type=str, default='duck',
+                   help='phase1 可视化优先使用的 QuickDraw 类别；不存在则退回验证集首样本')
+    p.add_argument('--viz_index', type=int, default=0,
+                   help='可视化样本在类别文件或验证集中的索引')
 
     # 随机初始 cursor（关键：迫使模型必须看 target image）
     p.add_argument('--random_init_cursor', action='store_true', default=True,
@@ -305,8 +314,127 @@ def schedule_teacher_forcing_prob(args, epoch):
         return start
 
     end = float(args.teacher_forcing_end)
-    progress = min(max((epoch - 1) / float(args.teacher_forcing_decay_epochs - 1), 0.0), 1.0)
+    warmup = max(int(args.teacher_forcing_warmup_epochs), 0)
+    if epoch <= warmup:
+        return start
+    decay_epoch = epoch - warmup
+    progress = min(max((decay_epoch - 1) / float(args.teacher_forcing_decay_epochs - 1), 0.0), 1.0)
     return start + (end - start) * progress
+
+
+def _tensor_mask_to_pil(mask: torch.Tensor) -> Image.Image:
+    arr = mask.detach().float().cpu().clamp(0, 1).numpy()
+    arr = ((1.0 - arr) * 255.0).astype('uint8')
+    return Image.fromarray(arr, mode='L').convert('RGB')
+
+
+def _draw_title(img: Image.Image, title: str) -> Image.Image:
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    draw.rectangle([0, 0, min(out.width, 420), 22], fill='white')
+    draw.text((6, 5), title, fill=(0, 0, 0))
+    return out
+
+
+def _make_compare_panel(images):
+    w, h = images[0].size
+    panel = Image.new('RGB', (w * len(images), h), 'white')
+    for i, img in enumerate(images):
+        panel.paste(img.resize((w, h)), (i * w, 0))
+    return panel
+
+
+def _rollout_for_viz(model, renderer, batch, device, args, teacher_forcing_prob: float):
+    losses, rollout = run_step(
+        model, renderer, lambda *a, **k: {'total': torch.zeros((), device=device)},
+        batch, device, args, 0.0, training=False,
+        teacher_forcing_prob=teacher_forcing_prob,
+    )
+    return losses, rollout
+
+
+def _pen_stats(seq: torch.Tensor) -> str:
+    pen = seq.detach().float().cpu()[0, :, 0]
+    pen_up = int((pen >= 0.5).sum().item())
+    pen_down = int((pen < 0.5).sum().item())
+    return f'len={pen.numel()} pen_down={pen_down} pen_up={pen_up} mean_pen_up={pen.mean().item():.4f}'
+
+
+def build_viz_batch(args, val_ds):
+    if args.phase != 1 or args.viz_every <= 0:
+        return None, 'disabled'
+
+    sample = None
+    label = None
+    npz_path = os.path.join(
+        args.dataset_root, 'QuickDraw-clean', 'test', f'{args.viz_category}.npz')
+    if os.path.exists(npz_path):
+        try:
+            data = __import__('numpy').load(npz_path, allow_pickle=True, encoding='latin1')
+            strokes = data['stroke3'].tolist()
+            if strokes:
+                from dataset import render_stroke3_tensor, stroke3_to_normalized_xy
+                from dataset import quickdraw_stroke3_to_7d, pad_strokes
+                import numpy as np
+                idx = min(max(int(args.viz_index), 0), len(strokes) - 1)
+                stroke3 = np.asarray(strokes[idx], dtype=np.float32)
+                target_image = render_stroke3_tensor(stroke3, args.image_size)
+                target_stroke = 1.0 - target_image.squeeze(0)
+                points = stroke3_to_normalized_xy(stroke3)
+                gt, mask, seq_len = pad_strokes(
+                    quickdraw_stroke3_to_7d(stroke3, args.image_size),
+                    args.max_seq_len,
+                )
+                sample = {
+                    'target_image': target_image,
+                    'target_stroke_img': target_stroke,
+                    'gt_strokes': torch.from_numpy(gt),
+                    'gt_mask': torch.from_numpy(mask),
+                    'init_cursor': torch.from_numpy(points[0].astype(np.float32)),
+                    'seq_len': seq_len,
+                }
+                label = f'{args.viz_category}[{idx}]'
+        except Exception as exc:
+            label = f'{args.viz_category} unavailable: {exc}'
+
+    if sample is None:
+        sample = val_ds[min(max(int(args.viz_index), 0), len(val_ds) - 1)]
+        label = label or f'val[{args.viz_index}]'
+
+    batch = {}
+    for key, value in sample.items():
+        if torch.is_tensor(value):
+            batch[key] = value.unsqueeze(0)
+    return batch, label
+
+
+@torch.no_grad()
+def save_epoch_visualization(model, renderer, viz_batch, viz_label, device, epoch, args):
+    if viz_batch is None or args.viz_every <= 0 or epoch % args.viz_every != 0:
+        return
+
+    model.eval()
+    rollout_model = model.module if isinstance(model, DDP) else model
+    out_dir = os.path.join(args.output_dir, 'viz_epoch')
+    os.makedirs(out_dir, exist_ok=True)
+
+    batch = {k: v.to(device, non_blocking=True) for k, v in viz_batch.items()}
+    _, rollout_tf = _rollout_for_viz(rollout_model, renderer, batch, device, args, 1.0)
+    _, rollout_free = _rollout_for_viz(rollout_model, renderer, batch, device, args, 0.0)
+
+    original = _draw_title(_tensor_mask_to_pil(batch['target_stroke_img'][0]), f'Original {viz_label}')
+    tf_img = _draw_title(_tensor_mask_to_pil(rollout_tf['rendered'][0]), 'Generated TF100')
+    free_img = _draw_title(_tensor_mask_to_pil(rollout_free['rendered'][0]), 'Generated Free')
+    panel = _make_compare_panel([original, tf_img, free_img])
+    image_path = os.path.join(out_dir, f'epoch_{epoch:04d}_compare.png')
+    panel.save(image_path)
+
+    stats_path = os.path.join(out_dir, f'epoch_{epoch:04d}_stats.txt')
+    with open(stats_path, 'w') as f:
+        f.write(f'sample={viz_label}\n')
+        f.write(f'tf100: {_pen_stats(rollout_tf["seq"])}\n')
+        f.write(f'free:  {_pen_stats(rollout_free["seq"])}\n')
+    print(f'  ↳ saved visualization {image_path}')
 
 
 def sample_init_cursors_from_stroke(target_stroke_img: torch.Tensor,
@@ -570,7 +698,7 @@ def main():
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
             'epoch', 'ss_prob', 'tf_prob',
-            'train_loss', 'val_tf_loss', 'val_free_loss', 'best_val_loss',
+            'train_loss', 'val_tf100_loss', 'val_free_loss', 'selected_metric_loss',
         ])
         if args.use_tensorboard:
             try:
@@ -586,6 +714,9 @@ def main():
     train_ds, val_ds = build_dataset(args)
     if is_main:
         print(f'Train {len(train_ds)} / Val {len(val_ds)}')
+    viz_batch, viz_label = build_viz_batch(args, val_ds)
+    if is_main and args.viz_every > 0:
+        print(f'Visualization sample: {viz_label}')
 
     if world_size > 1:
         train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
@@ -629,7 +760,8 @@ def main():
     optim_ = optim.AdamW(model.parameters(), lr=args.lr,
                           weight_decay=args.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optim_, T_max=args.epochs)
-    best = float('inf')
+    best_tf = float('inf')
+    best_free = float('inf')
     epochs_without_improve = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -640,7 +772,7 @@ def main():
             model, renderer, loss_fn, train_loader, optim_, device, epoch, args)
         val_tf_loss, val_tf_comp = validate(
             model, renderer, loss_fn, val_loader, device, epoch, args,
-            teacher_forcing_prob=tf_prob, tag='ValTF')
+            teacher_forcing_prob=1.0, tag='ValTF100')
         val_free_loss, val_free_comp = validate(
             model, renderer, loss_fn, val_loader, device, epoch, args,
             teacher_forcing_prob=0.0, tag='ValFree')
@@ -658,42 +790,56 @@ def main():
 
         if is_main:
             print(f'Epoch {epoch}/{args.epochs}  '
-                  f'train={train_loss:.4f}  val_tf={val_tf_loss:.4f}  '
-                  f'val_free={val_free_loss:.4f}  best({args.best_metric})={best:.4f}  '
+                  f'train={train_loss:.4f}  val_tf100={val_tf_loss:.4f}  '
+                  f'val_free={val_free_loss:.4f}  best_tf={best_tf:.4f}  '
+                  f'best_free={best_free:.4f}  '
                   f'tf_prob={tf_prob:.3f}')
             print('  train_comp:', {k: round(v, 4) for k, v in train_comp.items()})
-            print('  val_tf_comp:',   {k: round(v, 4) for k, v in val_tf_comp.items()})
+            print('  val_tf100_comp:', {k: round(v, 4) for k, v in val_tf_comp.items()})
             print('  val_free_comp:', {k: round(v, 4) for k, v in val_free_comp.items()})
 
             csv_writer.writerow([epoch, ss_prob, tf_prob, train_loss,
-                                 val_tf_loss, val_free_loss, best,
+                                 val_tf_loss, val_free_loss, metric_loss,
                                  *[round(v, 6) for v in train_comp.values()],
                                  *[round(v, 6) for v in val_tf_comp.values()],
                                  *[round(v, 6) for v in val_free_comp.values()]])
             if writer:
                 writer.add_scalar('loss/train', train_loss, epoch)
-                writer.add_scalar('loss/val_tf', val_tf_loss, epoch)
+                writer.add_scalar('loss/val_tf100', val_tf_loss, epoch)
                 writer.add_scalar('loss/val_free', val_free_loss, epoch)
                 writer.add_scalar('ss_prob', ss_prob, epoch)
                 writer.add_scalar('tf_prob', tf_prob, epoch)
                 for k, v in train_comp.items():
                     writer.add_scalar(f'train/{k}', v, epoch)
                 for k, v in val_tf_comp.items():
-                    writer.add_scalar(f'val_tf/{k}', v, epoch)
+                    writer.add_scalar(f'val_tf100/{k}', v, epoch)
                 for k, v in val_free_comp.items():
                     writer.add_scalar(f'val_free/{k}', v, epoch)
                 writer.flush()
 
-            if metric_loss < best - args.early_stop_min_delta:
-                best = metric_loss
-                epochs_without_improve = 0
-                save_checkpoint(model, optim_, epoch, metric_loss,
+            improved_tf = val_tf_loss < best_tf - args.early_stop_min_delta
+            improved_free = val_free_loss < best_free - args.early_stop_min_delta
+            if improved_tf:
+                best_tf = val_tf_loss
+                save_checkpoint(model, optim_, epoch, val_tf_loss,
+                                os.path.join(args.output_dir, 'model_best_tf.pth'), args)
+                # 兼容旧推理脚本默认 ckpt 名称：phase1 以 TF100 best 作为主模型。
+                save_checkpoint(model, optim_, epoch, val_tf_loss,
                                 os.path.join(args.output_dir, 'model_best.pth'), args)
+            if improved_free:
+                best_free = val_free_loss
+                save_checkpoint(model, optim_, epoch, val_free_loss,
+                                os.path.join(args.output_dir, 'model_best_free.pth'), args)
+
+            improved_metric = improved_free if args.best_metric == 'val_free' else improved_tf
+            if improved_metric:
+                epochs_without_improve = 0
             else:
                 epochs_without_improve += 1
             if epoch % args.save_every == 0:
                 save_checkpoint(model, optim_, epoch, metric_loss,
                                 os.path.join(args.output_dir, f'model_epoch_{epoch}.pth'), args)
+            save_epoch_visualization(model, renderer, viz_batch, viz_label, device, epoch, args)
             if args.early_stop_patience > 0 and epochs_without_improve >= args.early_stop_patience:
                 print(f'Early stopping: no val improvement for {epochs_without_improve} epochs.')
                 break
@@ -701,7 +847,8 @@ def main():
     if is_main:
         save_checkpoint(model, optim_, epoch, metric_loss,
                         os.path.join(args.output_dir, 'model_final.pth'), args)
-        print(f'\nBest val loss: {best:.4f}')
+        print(f'\nBest val_tf100 loss: {best_tf:.4f}')
+        print(f'Best val_free loss: {best_free:.4f}')
         csv_file.close()
         if writer:
             writer.close()

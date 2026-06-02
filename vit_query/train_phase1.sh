@@ -56,6 +56,12 @@ $PY train.py \
   --lr 3e-5 \
   --grad_clip 0.5 \
   --teacher_forcing_prob 1.0 \
+  --teacher_forcing_end 0.3 \
+  --teacher_forcing_warmup_epochs 10 \
+  --teacher_forcing_decay_epochs 30 \
+  --best_metric val_tf \
+  --viz_every 10 \
+  --viz_category duck \
   --w_supervised 1.0 \
   --w_sup_pen 3.0 \
   --w_sup_pen_up 8.0 \
