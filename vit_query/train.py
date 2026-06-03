@@ -29,6 +29,7 @@ from model import ViTAutoregressiveExtractor7D, count_parameters
 from neural_renderer import NeuralRasterizorStep
 from dataset import QuickDrawCleanDataset, ImageOnlyDataset
 from losses import CombinedRolloutLoss
+from visualize import generate_order_image
 
 
 # --------------------------------------------------------------------- #
@@ -362,6 +363,23 @@ def _pen_stats(seq: torch.Tensor) -> str:
     return f'len={pen.numel()} pen_down={pen_down} pen_up={pen_up} mean_pen_up={pen.mean().item():.4f}'
 
 
+def _seq_to_thin_pil(seq: torch.Tensor, init_cursor: torch.Tensor,
+                     image_size: int, title: str) -> Image.Image:
+    import numpy as np
+
+    strokes = seq.detach().float().cpu()[0].numpy().astype(np.float32)
+    strokes[:, 0] = (strokes[:, 0] >= 0.5).astype(np.float32)
+    cursor = init_cursor.detach().float().cpu()[0].numpy().astype(np.float32)
+    img = generate_order_image(
+        strokes,
+        image_size=image_size,
+        line_width=2,
+        init_cursors=np.asarray([cursor], dtype=np.float32),
+        round_lengths=np.asarray([len(strokes)], dtype=np.int64),
+    )
+    return _draw_title(img, title)
+
+
 def build_viz_batch(args, val_ds):
     if args.phase != 1 or args.viz_every <= 0:
         return None, 'disabled'
@@ -426,11 +444,17 @@ def save_epoch_visualization(model, renderer, viz_batch, viz_label, device, epoc
     _, rollout_free = _rollout_for_viz(rollout_model, renderer, batch, device, args, 0.0)
 
     original = _draw_title(_tensor_mask_to_pil(batch['target_stroke_img'][0]), f'Original {viz_label}')
-    tf_img = _draw_title(_tensor_mask_to_pil(rollout_tf['rendered'][0]), 'Generated TF100')
-    free_img = _draw_title(_tensor_mask_to_pil(rollout_free['rendered'][0]), 'Generated Free')
+    tf_img = _seq_to_thin_pil(rollout_tf['seq'], batch['init_cursor'], args.image_size, 'Generated TF100 Thin')
+    free_img = _seq_to_thin_pil(rollout_free['seq'], batch['init_cursor'], args.image_size, 'Generated Free Thin')
     panel = _make_compare_panel([original, tf_img, free_img])
     image_path = os.path.join(out_dir, f'epoch_{epoch:04d}_compare.png')
     panel.save(image_path)
+
+    tf_canvas = _draw_title(_tensor_mask_to_pil(rollout_tf['rendered'][0]), 'TF100 Soft Canvas')
+    free_canvas = _draw_title(_tensor_mask_to_pil(rollout_free['rendered'][0]), 'Free Soft Canvas')
+    canvas_panel = _make_compare_panel([original, tf_canvas, free_canvas])
+    canvas_path = os.path.join(out_dir, f'epoch_{epoch:04d}_canvas_compare.png')
+    canvas_panel.save(canvas_path)
 
     stats_path = os.path.join(out_dir, f'epoch_{epoch:04d}_stats.txt')
     with open(stats_path, 'w') as f:

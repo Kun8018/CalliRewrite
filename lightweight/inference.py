@@ -13,14 +13,14 @@ import os
 import argparse
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 from pathlib import Path
 
 from model import ResNetAutoregressiveExtractor7D
 from neural_renderer import NeuralRasterizorStep
 from diffable_state import init_rollout_state, RolloutState
 from dataset import find_undrawn_cursor
-from visualize import visualize_strokes
+from visualize import generate_order_image, visualize_strokes
 
 
 def parse_args():
@@ -87,6 +87,54 @@ def preprocess(image_path, image_size):
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W) 1=BG
 
 
+def tensor_mask_to_pil(mask: torch.Tensor) -> Image.Image:
+    """1=stroke 的 soft mask -> 白底黑线 RGB 图，和 train.py 的 viz_epoch 一致。"""
+    arr = mask.detach().float().cpu().clamp(0, 1).numpy()
+    arr = ((1.0 - arr) * 255.0).astype(np.uint8)
+    return Image.fromarray(arr, mode='L').convert('RGB')
+
+
+def draw_title(img: Image.Image, title: str) -> Image.Image:
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    draw.rectangle([0, 0, min(out.width, 420), 22], fill='white')
+    draw.text((6, 5), title, fill=(0, 0, 0))
+    return out
+
+
+def save_free_rollout_images(image_path, rendered: torch.Tensor, raw_strokes: np.ndarray,
+                             raw_init_cursors, raw_round_lengths, output_dir, image_size):
+    original = Image.open(image_path).convert('L')
+    if original.size != (image_size, image_size):
+        original = original.resize((image_size, image_size))
+    original = draw_title(original.convert('RGB'), 'Original')
+    thin_generated = generate_order_image(
+        raw_strokes, image_size=image_size, line_width=2,
+        init_cursors=raw_init_cursors, round_lengths=raw_round_lengths,
+    )
+    thin_generated = draw_title(thin_generated, 'Generated Free Thin')
+    canvas_generated = draw_title(tensor_mask_to_pil(rendered), 'Generated Free Soft Canvas')
+
+    os.makedirs(output_dir, exist_ok=True)
+    thin_generated_path = os.path.join(output_dir, 'free_thin_generated.png')
+    thin_compare_path = os.path.join(output_dir, 'free_thin_compare.png')
+    canvas_generated_path = os.path.join(output_dir, 'soft_canvas.png')
+    canvas_compare_path = os.path.join(output_dir, 'soft_canvas_compare.png')
+    thin_generated.save(thin_generated_path)
+    canvas_generated.save(canvas_generated_path)
+
+    panel = Image.new('RGB', (image_size * 2, image_size), 'white')
+    panel.paste(original, (0, 0))
+    panel.paste(thin_generated, (image_size, 0))
+    panel.save(thin_compare_path)
+
+    canvas_panel = Image.new('RGB', (image_size * 2, image_size), 'white')
+    canvas_panel.paste(original, (0, 0))
+    canvas_panel.paste(canvas_generated, (image_size, 0))
+    canvas_panel.save(canvas_compare_path)
+    return thin_generated_path, thin_compare_path, canvas_generated_path, canvas_compare_path
+
+
 def trim_trailing_lifts(strokes: np.ndarray, max_consec: int):
     """seq_extract 风格：连续 max_consec 次 pen=1 就截断（这一轮结束）。"""
     if max_consec <= 0:
@@ -130,8 +178,12 @@ def infer_image(model, renderer, image_path, image_size, max_seq_len,
     state = None
     hidden = None
     all_strokes = []
+    raw_strokes_all = []
     init_cursors = []
+    raw_init_cursors = []
     round_lengths = []
+    raw_round_lengths = []
+    soft_rendered = None
 
     target_np = (1.0 - img_tensor[0, 0]).cpu().numpy()  # (H, W) 1=stroke
     first_cursor = None
@@ -149,7 +201,14 @@ def infer_image(model, renderer, image_path, image_size, max_seq_len,
         out = model.rollout(img_tensor, renderer, seq_len=max_seq_len,
                             init_state=state, init_hidden=hidden,
                             detach_canvas_for_encoder=True)
-        strokes = out['seq'][0].cpu().numpy().astype(np.float32)  # (T, 7)
+        soft_rendered = out['rendered'][0].detach().cpu()
+        raw_strokes = out['seq'][0].cpu().numpy().astype(np.float32)  # (T, 7)
+        raw_strokes[:, 0] = (raw_strokes[:, 0] > pen_threshold).astype(np.float32)
+        raw_init_cursors.append(init_cursor_round.copy())
+        raw_round_lengths.append(len(raw_strokes))
+        raw_strokes_all.append(raw_strokes.copy())
+
+        strokes = raw_strokes.copy()
         strokes[:, 0] = (strokes[:, 0] > pen_threshold).astype(np.float32)
         strokes = trim_trailing_lifts(strokes, max_consec)
         strokes = trim_long_pen_down_run(strokes, max_consecutive_downs)
@@ -189,10 +248,17 @@ def infer_image(model, renderer, image_path, image_size, max_seq_len,
         strokes_final = np.array([[1.0, 0.5, 0.5, 0.0, 0.0, 0.1, 1.0]], dtype=np.float32)
         round_lengths = [1]
         init_cursors = [np.array([0.5, 0.5], dtype=np.float32)]
+        if soft_rendered is None:
+            soft_rendered = torch.zeros((image_size, image_size), dtype=torch.float32)
+        raw_strokes_final = strokes_final.copy()
+        raw_init_cursors = init_cursors.copy()
+        raw_round_lengths = round_lengths.copy()
     else:
         strokes_final = np.concatenate(all_strokes, axis=0)
+        raw_strokes_final = np.concatenate(raw_strokes_all, axis=0)
 
-    return strokes_final, init_cursors, round_lengths
+    return (strokes_final, init_cursors, round_lengths, soft_rendered,
+            raw_strokes_final, raw_init_cursors, raw_round_lengths)
 
 
 def save_seq_extract_npz(output_path, strokes_data, image_size,
@@ -214,7 +280,8 @@ def save_seq_extract_npz(output_path, strokes_data, image_size,
 
 def process_one(model, renderer, image_path, output_dir, image_size, max_seq_len,
                 args, device):
-    strokes, init_cursors, round_lengths = infer_image(
+    (strokes, init_cursors, round_lengths, soft_rendered,
+     raw_strokes, raw_init_cursors, raw_round_lengths) = infer_image(
         model, renderer, image_path, image_size, max_seq_len,
         pen_threshold=args.pen_threshold,
         max_consec=args.max_consecutive_lifts,
@@ -230,9 +297,14 @@ def process_one(model, renderer, image_path, output_dir, image_size, max_seq_len
 
     vis_dir = os.path.join(output_dir, base)
     visualize_strokes(npz_path, original_img_path=image_path, output_dir=vis_dir)
+    _, thin_compare_path, _, canvas_compare_path = save_free_rollout_images(
+        image_path, soft_rendered, raw_strokes, raw_init_cursors,
+        raw_round_lengths, vis_dir, image_size)
 
     print(f'{image_path}: {len(strokes)} strokes  rounds={round_lengths}')
     print(f'  -> {npz_path}')
+    print(f'  -> {thin_compare_path}')
+    print(f'  -> {canvas_compare_path}')
 
 
 def main():
