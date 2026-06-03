@@ -7,6 +7,17 @@ CONDA_ENV=/data1/Calliwrite/kun/CalliRewrite/calli_train_env
 PY=$CONDA_ENV/bin/python
 export PYTHONNOUSERSITE=1
 
+ensure_tensorboard() {
+  if ! "$PY" - <<'PY' >/dev/null 2>&1
+from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+PY
+  then
+    echo "TensorBoard not found in $PY, installing..."
+    "$PY" -m pip install tensorboard
+  fi
+}
+ensure_tensorboard
+
 cd "$(dirname "$0")"
 
 if [ ! -f "output_renderer/raster_unit_pretrained.pth" ]; then
@@ -34,6 +45,8 @@ $PY train.py \
   --batch_size 8 \
   --epochs 100 \
   --lr 1e-4 \
+  --w_outside 0.05 \
+  --w_win_outside 10.0 \
   --num_workers 8 \
   --device cuda:0 \
   --use_tensorboard

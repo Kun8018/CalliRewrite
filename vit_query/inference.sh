@@ -21,8 +21,10 @@ OUTPUT_DIR="inference_output_v2"
 DEVICE="cuda:0"
 MAX_CONSECUTIVE_LIFTS=3
 MAX_CONSECUTIVE_DOWNS=24
-MAX_ROUNDS=1
+MAX_ROUNDS=10
 INIT_CURSOR_STRATEGY="stroke"
+FORCE_PEN_DOWN_UNTIL_JUMP=1
+PEN_JUMP_THRESHOLD=0.25
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -35,6 +37,9 @@ while [[ $# -gt 0 ]]; do
     --max_consecutive_downs) MAX_CONSECUTIVE_DOWNS="$2"; shift 2;;
     --max_rounds)        MAX_ROUNDS="$2"; shift 2;;
     --init_cursor_strategy) INIT_CURSOR_STRATEGY="$2"; shift 2;;
+    --force_pen_down_until_jump) FORCE_PEN_DOWN_UNTIL_JUMP=1; shift 1;;
+    --no_force_pen_down_until_jump) FORCE_PEN_DOWN_UNTIL_JUMP=0; shift 1;;
+    --pen_jump_threshold) PEN_JUMP_THRESHOLD="$2"; shift 2;;
     *) echo "Unknown option: $1"; exit 1;;
   esac
 done
@@ -58,6 +63,13 @@ echo "Checkpoint:     $CHECKPOINT"
 echo "Renderer ckpt:  $RENDERER_CKPT"
 echo "Input:          $INPUT"
 echo "Output dir:     $OUTPUT_DIR"
+echo "Force pen down: $FORCE_PEN_DOWN_UNTIL_JUMP"
+echo "Jump threshold: $PEN_JUMP_THRESHOLD"
+
+EXTRA_ARGS=()
+if [ "$FORCE_PEN_DOWN_UNTIL_JUMP" = "1" ]; then
+  EXTRA_ARGS+=(--force_pen_down_until_jump --pen_jump_threshold "$PEN_JUMP_THRESHOLD")
+fi
 
 $PY inference.py \
   --checkpoint "$CHECKPOINT" \
@@ -68,4 +80,5 @@ $PY inference.py \
   --max_consecutive_lifts "$MAX_CONSECUTIVE_LIFTS" \
   --max_consecutive_downs "$MAX_CONSECUTIVE_DOWNS" \
   --max_rounds "$MAX_ROUNDS" \
-  --init_cursor_strategy "$INIT_CURSOR_STRATEGY"
+  --init_cursor_strategy "$INIT_CURSOR_STRATEGY" \
+  "${EXTRA_ARGS[@]}"

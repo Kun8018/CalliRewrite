@@ -11,6 +11,17 @@ CONDA_ENV=/data1/Calliwrite/kun/CalliRewrite/calli_train_env
 PY=$CONDA_ENV/bin/python
 export PYTHONNOUSERSITE=1
 
+ensure_tensorboard() {
+  if ! "$PY" - <<'PY' >/dev/null 2>&1
+from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+PY
+  then
+    echo "TensorBoard not found in $PY, installing..."
+    "$PY" -m pip install tensorboard
+  fi
+}
+ensure_tensorboard
+
 cd "$(dirname "$0")"
 
 DATASET_ROOT=""

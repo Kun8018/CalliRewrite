@@ -151,6 +151,10 @@ def parse_args():
     p.add_argument('--w_outside', type=float, default=10.0)
     p.add_argument('--w_win_outside', type=float, default=10.0)
     p.add_argument('--w_early_pen', type=float, default=0.1)
+    p.add_argument('--early_pen_start_idx', type=int, default=0)
+    p.add_argument('--early_pen_end_idx', type=int, default=None)
+    p.add_argument('--normalize_pos_outside', action='store_true',
+                   help='将 pos_outside 除以 image_size；默认关闭以对齐 seq_extract 原版')
     p.add_argument('--w_supervised', type=float, default=None,
                    help='默认 phase1=0.1, phase2=0.0')
     p.add_argument('--w_sup_pen', type=float, default=1.0)
@@ -218,6 +222,28 @@ class Tee:
         self.log.close()
 
 
+def create_summary_writer(output_dir):
+    """Create a TensorBoard writer with a clear fallback path."""
+    tb_dir = os.path.join(output_dir, 'tensorboard')
+    os.makedirs(tb_dir, exist_ok=True)
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(tb_dir)
+        print(f'TensorBoard: {tb_dir} (torch.utils.tensorboard)')
+        return writer
+    except ImportError as torch_tb_error:
+        try:
+            from tensorboardX import SummaryWriter
+            writer = SummaryWriter(tb_dir)
+            print(f'TensorBoard: {tb_dir} (tensorboardX)')
+            return writer
+        except ImportError:
+            print('[warn] TensorBoard is not installed in this Python env.')
+            print(f'[warn] Install with: {sys.executable} -m pip install tensorboard')
+            print(f'[warn] Original import error: {torch_tb_error}')
+            return None
+
+
 # --------------------------------------------------------------------- #
 # build
 # --------------------------------------------------------------------- #
@@ -282,6 +308,9 @@ def build_model_renderer_loss(args, device):
         outside_weight=args.w_outside,
         win_outside_weight=args.w_win_outside,
         early_pen_weight=args.w_early_pen,
+        early_pen_start_idx=args.early_pen_start_idx,
+        early_pen_end_idx=args.early_pen_end_idx,
+        normalize_pos_outside=args.normalize_pos_outside,
         supervised_weight=args.w_supervised,
         sup_pen_weight=args.w_sup_pen,
         sup_coord_weight=args.w_sup_coord,
@@ -733,14 +762,7 @@ def main():
             'train_loss', 'val_tf100_loss', 'val_free_loss', 'selected_metric_loss',
         ])
         if args.use_tensorboard:
-            try:
-                from torch.utils.tensorboard import SummaryWriter
-                tb_dir = os.path.join(args.output_dir, 'tensorboard')
-                os.makedirs(tb_dir, exist_ok=True)
-                writer = SummaryWriter(tb_dir)
-                print(f'TensorBoard: {tb_dir}')
-            except ImportError:
-                print('TensorBoard not available')
+            writer = create_summary_writer(args.output_dir)
 
     # 2) 数据
     train_ds, val_ds = build_dataset(args)

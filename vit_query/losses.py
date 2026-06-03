@@ -43,14 +43,16 @@ class PerceptualCost(nn.Module):
 
 def stroke_num_cost(pred_seq: torch.Tensor) -> torch.Tensor:
     """pred_seq: (N, T, 7) — 注意 [:, :, 0] 是 pen_soft ∈ [0, 1]
-       原版 stroke_num_loss = 1 - mean(pen_state)，pen=0 表示落笔，所以
-       1 - E[pen] 越小 → 落笔越多 → loss 越大；反过来，越大越好。
-       等价：loss = mean(pen)（越大表示越多抬笔，惩罚）→ 与原版语义一致。"""
-    return pred_seq[..., 0].mean()
+       原版 stroke_num_loss = 1 - mean(pen_state)，pen=0 表示落笔，pen=1 表示抬笔。
+       这里保持和 seq_extract/model_common_train.py 的 get_stroke_num_loss 一致。"""
+    return 1.0 - pred_seq[..., 0].mean()
 
 
 def smoothness_cost(pred_seq: torch.Tensor) -> torch.Tensor:
-    """相邻 (x2, y2) 向量余弦相似度（仅对相邻都落笔的步），返回 1 - mean(cos)。"""
+    """对齐 seq_extract get_smoothness_loss。
+
+    原版先用相邻两步都落笔的 mask 乘到 cos 上，再 gather 非零项求均值。
+    """
     x2y2 = pred_seq[..., 3:5]
     pen = pred_seq[..., 0]
     drawing = 1.0 - pen  # 1=落笔
@@ -58,33 +60,35 @@ def smoothness_cost(pred_seq: torch.Tensor) -> torch.Tensor:
     a2 = x2y2[:, 1:]
     norm = a1.norm(dim=-1) * a2.norm(dim=-1) + 1e-8
     cos = (a1 * a2).sum(dim=-1) / norm  # (N, T-1)
-    w = drawing[:, :-1] * drawing[:, 1:]
-    if w.sum() < 1.0:
+    rst = drawing[:, :-1] * cos * drawing[:, 1:]
+    valid = rst != 0
+    if not valid.any():
         return torch.tensor(0.0, device=pred_seq.device, dtype=pred_seq.dtype)
-    return 1.0 - (cos * w).sum() / w.sum().clamp_min(1.0)
+    return 1.0 - rst[valid].mean()
 
 
 def angle_cost(pred_seq: torch.Tensor) -> torch.Tensor:
     """seq_extract get_angle_loss：(x2,y2) vs (-1,-1) 的余弦相似度，落笔且 cos > 0.5 时算。
-       注意原版返回 -final * 10 的总系数是 angle_loss_weight=1.0 自带的；这里返回原值，
-       train.py 中按 weights 加权。"""
+       原版是 where(rst > 0.5, rst, 0) 后对全矩阵 mean，再乘 10。"""
     x2y2 = pred_seq[:, 1:, 3:5]
     pen_curr = pred_seq[:, 1:, 0]
     pen_prev = pred_seq[:, :-1, 0]
     ref = torch.full_like(x2y2, -1.0)
     norm = x2y2.norm(dim=-1) * ref.norm(dim=-1) + 1e-8
     cos = (x2y2 * ref).sum(dim=-1) / norm
-    mask = (1.0 - pen_curr) * pen_prev  # 当前落笔 且 上一步抬笔 → 笔画起点
-    # 原版用 where(rst > 0.5, rst, 0)，等价惩罚 cos > 0.5 的情形
-    final = (cos * mask).clamp(min=0.5)
-    final = (final - 0.5) * (mask)  # 把 < 0.5 的清零
+    rst = cos * (1.0 - pen_curr) * pen_prev
+    final = torch.where(rst > 0.5, rst, torch.zeros_like(rst))
     return final.mean() * 10.0
 
 
-def pos_outside_cost(pos_before: torch.Tensor, img_size: int) -> torch.Tensor:
+def pos_outside_cost(pos_before: torch.Tensor, img_size: int,
+                     normalize: bool = False) -> torch.Tensor:
     """pos_before: (N, T, 2) pixel-space pre-clip cursor 位置"""
     pos_after = torch.clamp(pos_before, 0.0, float(img_size - 1))
-    return (pos_before - pos_after).abs().mean() / float(img_size)
+    loss = (pos_before - pos_after).abs().mean()
+    if normalize:
+        loss = loss / float(img_size)
+    return loss
 
 
 def win_size_outside_cost(win_before: torch.Tensor, img_size: int) -> torch.Tensor:
@@ -94,9 +98,14 @@ def win_size_outside_cost(win_before: torch.Tensor, img_size: int) -> torch.Tens
     return (top + bot).mean()
 
 
-def early_pen_states_cost(pred_seq: torch.Tensor, early_len: int = 7) -> torch.Tensor:
-    """前 early_len 步：取每个 batch 的 pen 最小值再平均。原版越低越好。"""
-    early = pred_seq[:, :early_len, 0]  # (N, K)
+def early_pen_states_cost(pred_seq: torch.Tensor, early_len: int = 7,
+                          start_idx: int = 0, end_idx: int = None) -> torch.Tensor:
+    """对齐 seq_extract get_early_pen_states_loss 的区间形式。"""
+    T = pred_seq.shape[1]
+    start = max(int(start_idx), 0)
+    end = int(end_idx) if end_idx is not None else start + int(early_len)
+    end = min(max(end, start + 1), T)
+    early = pred_seq[:, start:end, 0]  # (N, K)
     return early.min(dim=1).values.mean()
 
 
@@ -180,6 +189,9 @@ class CombinedRolloutLoss(nn.Module):
                  win_outside_weight: float = 10.0,
                  early_pen_weight: float = 0.1,
                  early_pen_length: int = 7,
+                 early_pen_start_idx: int = 0,
+                 early_pen_end_idx: int = None,
+                 normalize_pos_outside: bool = False,
                  supervised_weight: float = 1.0,
                  sup_pen_weight: float = 1.0,
                  sup_coord_weight: float = 5.0,
@@ -198,6 +210,9 @@ class CombinedRolloutLoss(nn.Module):
         self.win_outside_weight = win_outside_weight
         self.early_pen_weight = early_pen_weight
         self.early_pen_length = early_pen_length
+        self.early_pen_start_idx = early_pen_start_idx
+        self.early_pen_end_idx = early_pen_end_idx
+        self.normalize_pos_outside = normalize_pos_outside
         self.supervised_weight = supervised_weight
         self.use_perceptual = use_perceptual
         self.use_l1_raster = use_l1_raster
@@ -256,7 +271,8 @@ class CombinedRolloutLoss(nn.Module):
             total = total + self.angle_weight * self.stroke_num_weight * ag
 
         # outside
-        pos_out = pos_outside_cost(pos_before, img_size)
+        pos_out = pos_outside_cost(
+            pos_before, img_size, normalize=self.normalize_pos_outside)
         comp['pos_outside'] = pos_out.detach().float().item()
         total = total + self.outside_weight * pos_out
 
@@ -265,7 +281,11 @@ class CombinedRolloutLoss(nn.Module):
         total = total + self.win_outside_weight * win_out
 
         # early pen
-        epc = early_pen_states_cost(pred_seq, self.early_pen_length)
+        epc = early_pen_states_cost(
+            pred_seq, self.early_pen_length,
+            start_idx=self.early_pen_start_idx,
+            end_idx=self.early_pen_end_idx,
+        )
         comp['early_pen'] = epc.detach().float().item()
         total = total + self.early_pen_weight * epc
 

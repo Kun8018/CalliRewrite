@@ -217,6 +217,28 @@ class Tee:
         self.log.close()
 
 
+def create_summary_writer(output_dir):
+    """Create a TensorBoard writer with a clear fallback path."""
+    tb_dir = os.path.join(output_dir, 'tensorboard')
+    os.makedirs(tb_dir, exist_ok=True)
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(tb_dir)
+        print(f'TensorBoard: {tb_dir} (torch.utils.tensorboard)')
+        return writer
+    except ImportError as torch_tb_error:
+        try:
+            from tensorboardX import SummaryWriter
+            writer = SummaryWriter(tb_dir)
+            print(f'TensorBoard: {tb_dir} (tensorboardX)')
+            return writer
+        except ImportError:
+            print('[warn] TensorBoard is not installed in this Python env.')
+            print(f'[warn] Install with: {sys.executable} -m pip install tensorboard')
+            print(f'[warn] Original import error: {torch_tb_error}')
+            return None
+
+
 # --------------------------------------------------------------------- #
 # build
 # --------------------------------------------------------------------- #
@@ -725,14 +747,7 @@ def main():
             'train_loss', 'val_tf100_loss', 'val_free_loss', 'selected_metric_loss',
         ])
         if args.use_tensorboard:
-            try:
-                from torch.utils.tensorboard import SummaryWriter
-                tb_dir = os.path.join(args.output_dir, 'tensorboard')
-                os.makedirs(tb_dir, exist_ok=True)
-                writer = SummaryWriter(tb_dir)
-                print(f'TensorBoard: {tb_dir}')
-            except ImportError:
-                print('TensorBoard not available')
+            writer = create_summary_writer(args.output_dir)
 
     # 2) 数据
     train_ds, val_ds = build_dataset(args)

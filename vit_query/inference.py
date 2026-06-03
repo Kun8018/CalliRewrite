@@ -41,6 +41,10 @@ def parse_args():
     p.add_argument('--max_rounds', type=int, default=4)
     p.add_argument('--init_cursor_strategy', choices=['center', 'stroke'], default='stroke',
                    help='第一轮起笔位置：center=图像中心，stroke=最大未绘制笔画区域')
+    p.add_argument('--force_pen_down_until_jump', action='store_true',
+                   help='实验模式：忽略 pen 分类器，除非预测位移超过阈值，否则强制落笔')
+    p.add_argument('--pen_jump_threshold', type=float, default=0.25,
+                   help='force_pen_down_until_jump 模式下的抬笔阈值，单位为画布宽度比例')
     return p.parse_args()
 
 
@@ -165,6 +169,24 @@ def trim_long_pen_down_run(strokes: np.ndarray, max_consec: int):
     return strokes
 
 
+def apply_force_pen_down_until_jump(strokes: np.ndarray, window_sizes: np.ndarray,
+                                    image_size: int, jump_threshold: float) -> np.ndarray:
+    """Force drawing continuity unless predicted endpoint jumps too far on canvas."""
+    if len(strokes) == 0:
+        return strokes
+    if window_sizes is None:
+        win = np.full((len(strokes), 1), float(min(128, image_size)), dtype=np.float32)
+    else:
+        win = np.asarray(window_sizes, dtype=np.float32).reshape(-1, 1)
+    if len(win) != len(strokes):
+        win = np.full((len(strokes), 1), float(min(128, image_size)), dtype=np.float32)
+    endpoint_delta = strokes[:, 3:5] * win / (2.0 * float(image_size))
+    jump = np.linalg.norm(endpoint_delta, axis=1)
+    forced = strokes.copy()
+    forced[:, 0] = (jump > float(jump_threshold)).astype(np.float32)
+    return forced
+
+
 def make_state_with_cursor(cursor: np.ndarray, image_size: int, device) -> RolloutState:
     state = init_rollout_state(1, image_size, device)
     state.cursor = torch.from_numpy(cursor.astype(np.float32)).to(device).unsqueeze(0)
@@ -174,7 +196,9 @@ def make_state_with_cursor(cursor: np.ndarray, image_size: int, device) -> Rollo
 @torch.no_grad()
 def infer_image(model, renderer, image_path, image_size, max_seq_len,
                 pen_threshold=0.5, max_consec=3, max_rounds=4,
-                init_cursor_strategy='stroke', max_consecutive_downs=24, device='cuda'):
+                init_cursor_strategy='stroke', max_consecutive_downs=24,
+                force_pen_down_until_jump=False, pen_jump_threshold=0.25,
+                device='cuda'):
     img_tensor = preprocess(image_path, image_size).to(device)  # (1, 1, H, W) 1=BG
     state = None
     hidden = None
@@ -201,18 +225,28 @@ def infer_image(model, renderer, image_path, image_size, max_seq_len,
 
         out = model.rollout(img_tensor, renderer, seq_len=max_seq_len,
                             init_state=state, init_hidden=hidden,
-                            detach_canvas_for_encoder=True)
+                            detach_canvas_for_encoder=True,
+                            force_pen_down_until_jump=force_pen_down_until_jump,
+                            pen_jump_threshold=pen_jump_threshold)
         soft_rendered = out['rendered'][0].detach().cpu()
         raw_strokes = out['seq'][0].cpu().numpy().astype(np.float32)  # (T, 7)
-        raw_strokes[:, 0] = (raw_strokes[:, 0] > pen_threshold).astype(np.float32)
+        if force_pen_down_until_jump:
+            window_sizes = out.get('window_sizes')
+            if window_sizes is not None:
+                window_sizes = window_sizes[0].detach().cpu().numpy()
+            raw_strokes = apply_force_pen_down_until_jump(
+                raw_strokes, window_sizes, image_size, pen_jump_threshold)
+        else:
+            raw_strokes[:, 0] = (raw_strokes[:, 0] > pen_threshold).astype(np.float32)
         raw_init_cursors.append(init_cursor_round.copy())
         raw_round_lengths.append(len(raw_strokes))
         raw_strokes_all.append(raw_strokes.copy())
 
         strokes = raw_strokes.copy()
-        strokes[:, 0] = (strokes[:, 0] > pen_threshold).astype(np.float32)
-        strokes = trim_trailing_lifts(strokes, max_consec)
-        strokes = trim_long_pen_down_run(strokes, max_consecutive_downs)
+        if not force_pen_down_until_jump:
+            strokes[:, 0] = (strokes[:, 0] > pen_threshold).astype(np.float32)
+            strokes = trim_trailing_lifts(strokes, max_consec)
+            strokes = trim_long_pen_down_run(strokes, max_consecutive_downs)
 
         if len(strokes) == 0:
             break
@@ -289,6 +323,8 @@ def process_one(model, renderer, image_path, output_dir, image_size, max_seq_len
         max_rounds=args.max_rounds,
         init_cursor_strategy=args.init_cursor_strategy,
         max_consecutive_downs=args.max_consecutive_downs,
+        force_pen_down_until_jump=args.force_pen_down_until_jump,
+        pen_jump_threshold=args.pen_jump_threshold,
         device=device,
     )
     os.makedirs(output_dir, exist_ok=True)

@@ -32,6 +32,17 @@ fi
 # 屏蔽用户级 site-packages（避免被 /home/<user>/.local 污染）
 export PYTHONNOUSERSITE=1
 
+ensure_tensorboard() {
+  if ! "$PY" - <<'PY' >/dev/null 2>&1
+from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+PY
+  then
+    echo "TensorBoard not found in $PY, installing..."
+    "$PY" -m pip install tensorboard
+  fi
+}
+ensure_tensorboard
+
 # 4 卡 DDP，单卡 batch=12 → 全局 batch=48
 # max_items_per_category=5000 → 共 5 万样本（10 类）/ epoch
 # cache_size=0 → 关闭 dataset 内存 cache（避免 4 rank × 8 worker × 12GB = OOM）

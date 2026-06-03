@@ -271,7 +271,9 @@ class ViTAutoregressiveExtractor7D(nn.Module):
                 detach_canvas_for_encoder: bool = True,
                 init_state: RolloutState = None,
                 init_hidden: torch.Tensor = None,
-                init_cursor: torch.Tensor = None) -> dict:
+                init_cursor: torch.Tensor = None,
+                force_pen_down_until_jump: bool = False,
+                pen_jump_threshold: float = 0.25) -> dict:
         if seq_len is None:
             seq_len = self.max_seq_len
         target_mask = 1.0 - target_image
@@ -311,6 +313,18 @@ class ViTAutoregressiveExtractor7D(nn.Module):
                                       state_for_enc, step_index, hidden)
             pred = self.head(hidden)
             pen_logits_list.append(pred['pen_logits'])
+
+            if force_pen_down_until_jump:
+                curr_window = state.prev_scaling * state.prev_window_size
+                curr_window = torch.clamp(curr_window, MIN_WINDOW_SIZE, float(state.img_size))
+                endpoint_delta = pred['x2y2'] * curr_window / (2.0 * float(state.img_size))
+                jump = endpoint_delta.norm(dim=-1)
+                forced_pen = (jump > float(pen_jump_threshold)).to(dtype=dtype)
+                pred = {
+                    **pred,
+                    'pen_state_soft': forced_pen,
+                    'pen_state_hard': forced_pen,
+                }
 
             step_pred = pred
             if gt_strokes is not None and t < gt_strokes.shape[1] and teacher_forcing_prob > 0.0:
