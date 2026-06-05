@@ -166,7 +166,12 @@ def step_with_renderer(state: RolloutState,
     # ---- cursor 更新（沿用原版 stop_accu_grad 策略：cursor 累加只走 stop_gradient）----
     # delta = x2y2 * curr_window / 2 （像素单位）→ 归一化到 [0,1]
     cursor_px = state.cursor.detach() * float(img_size)  # 不让 cursor 长链梯度累加
-    delta_px = x2y2 * curr_window_size / 2.0  # 注意：x2y2 是 (dx, dy)，对应 cursor 的 x/y
+    # 本仓库的 GT (dataset._normalized_points_to_seq7) 用 cursor=cur 直接推进，x2y2 不交换；
+    # 渲染 patch 端点也用不交换的 x2y2。因此 cursor 推进必须同样不交换，否则 GT 监督
+    # (coord_diff) 与 raster_cost 互相打架 → 模型坍塌成"往下掉的粗笔"。
+    # （seq_extract 原版 L1004 交换 x/y 是因为它 GT 和 rollout 共用同一套带交换的渲染路径，
+    #   而本移植版 GT 是独立函数生成、不带交换，所以这里不能照搬交换。）
+    delta_px = x2y2 * curr_window_size / 2.0
     new_cursor_px = cursor_px + delta_px
     pos_before_clip = new_cursor_px.clone()  # 暴露给 outside_loss
     new_cursor_px = torch.clamp(new_cursor_px, 0.0, float(img_size - 1))

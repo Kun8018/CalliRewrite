@@ -1,4 +1,4 @@
-"""ResNet-18 + GRU 自回归笔画提取器（对齐 seq_extract 设计）。
+"""ResNet-18 + HyperLSTM 自回归笔画提取器（对齐 seq_extract 设计）。
 
 关键改动相比上一版：
 1. 输出激活遵循 seq_extract:get_mixture_coef
@@ -22,6 +22,7 @@ from diffable_state import (
     RolloutState, init_rollout_state, crop_patch_around_cursor, step_with_renderer,
     MIN_WIDTH, MAX_SCALING, MIN_WINDOW_SIZE,
 )
+from rnn import HyperLSTMCell
 
 
 class ResNetFeatureBackbone(nn.Module):
@@ -214,7 +215,17 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             nn.GELU(),
             nn.LayerNorm(hidden_dim),
         )
-        self.gru = nn.GRUCell(hidden_dim, hidden_dim)
+        self.gru = HyperLSTMCell(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            forget_bias=1.0,
+            use_recurrent_dropout=True,
+            dropout_keep_prob=0.9,
+            use_layer_norm=True,
+            hyper_num_units=256,
+            hyper_embedding_size=32,
+            hyper_use_recurrent_dropout=False
+        )
 
         self.head = StrokeHead(hidden_dim)
 
@@ -228,7 +239,7 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
         return tokens, global_feat
 
     def encode_step(self, target_tokens, target_global, target_mask, state: RolloutState,
-                    step_index: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+                    step_index: torch.Tensor, hidden):
         """target_mask: (N, 1, H, W), state: 当前 rollout 状态, step_index: (N, 1) ∈ [0, 1]"""
         curr_window = state.prev_scaling * state.prev_window_size
         curr_window = torch.clamp(curr_window, MIN_WINDOW_SIZE, float(state.img_size))
@@ -260,7 +271,9 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
             window_feat + step_feat
         ], dim=-1))
 
-        return self.gru(gru_input, hidden)
+        # HyperLSTM returns (h, new_state)
+        h, new_state = self.gru(gru_input, hidden)
+        return h, new_state
 
     # --------------------------------------------------------------------- #
     # rollout
@@ -324,10 +337,11 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
         else:
             state = init_state
 
-        if init_hidden is None:
-            hidden = torch.zeros(N, self.hidden_dim, device=device, dtype=dtype)
-        else:
+        if init_hidden is not None:
             hidden = init_hidden
+        else:
+            # HyperLSTM initial state: (total_h, total_c)
+            hidden = self.gru.get_initial_state(N, device)
 
         seqs = []
         pen_logits_list = []
@@ -351,9 +365,9 @@ class ResNetAutoregressiveExtractor7D(nn.Module):
                     prev_stroke=state.prev_stroke,
                     img_size=state.img_size,
                 )
-            hidden = self.encode_step(target_tokens, target_global, target_mask,
+            h, hidden = self.encode_step(target_tokens, target_global, target_mask,
                                       state_for_enc, step_index, hidden)
-            pred = self.head(hidden)
+            pred = self.head(h)
 
             # 记录中间值（pre-step）
             pen_logits_list.append(pred['pen_logits'])
